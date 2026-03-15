@@ -1,0 +1,39 @@
+[tool.black]
+# 忽略 .git, .mypy_cache, .tox, venv, 以及你的数据集文件夹
+# 这里的 /datasets/ 换成你实际存放大量图片的文件夹名字
+extend-exclude = '''
+(
+  /venv/
+  | /envs/
+  | /.git/
+  | /outputs/
+  | /data/
+
+)
+'''
+
+[tool.ruff]
+# Ruff config remains default
+
+[tool.mypy]
+ignore_missing_imports = true
+check_untyped_defs = true
+disable_error_code = ["type-arg", "assignment", "misc", "attr-defined", "var-annotated", "union-attr", "operator", "arg-type"]
+
+[[tool.mypy.overrides]]
+module = [
+    "tqdm.*",
+    "pandas.*",
+    "seaborn.*",
+    "sklearn.*",
+    "torchvision.*",
+    "ultralytics.*",
+    "cv2.*",
+    "PIL.*"
+]
+ignore_missing_imports = true
+
+[tool.rye]
+dev-dependencies = [
+    "mypy>=1.19.1",
+]

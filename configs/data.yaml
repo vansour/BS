@@ -1,0 +1,23 @@
+# 数据集配置
+# Dataset Configuration
+
+# 原始数据路径
+raw_data_dir: "data/UA-DETRAC/DETRAC-train-data/Insight-MVT_Annotation_Train"
+
+# 深度缓存路径
+depth_cache_dir: "outputs/Depth_Cache"
+
+# YOLO 数据集输出路径
+yolo_dataset_dir: "outputs/YOLO_Dataset_Patchy"
+
+# 增强数据路径
+augmented_data_dir: "outputs/Processed_Patchy_Data"
+
+# 标签文件
+fog_labels_file: "outputs/fog_labels.txt"
+
+# XML 标注路径
+xml_dir: "data/UA-DETRAC/DETRAC-Train-Annotations-XML"
+
+# 序列划分比例
+train_ratio: 0.8

@@ -1,0 +1,26 @@
+# 推理配置文件
+# Inference Configuration
+
+# 模型路径
+model_path: "outputs/Fog_Detection_Project/unified_model.pt"
+
+# 视频源（0 表示摄像头，或视频文件路径）
+video_source: 0
+
+# 显示配置
+display:
+  window_width: 960
+  window_height: 540
+  status_bar_height: 80
+
+# 自适应阈值配置
+adaptive_threshold:
+  base_conf_thres: 0.25
+  ema_alpha: 0.1
+  beta_scale_factor: 1.2
+  min_conf_thres: 0.15
+
+# CUDA 配置
+cuda:
+  enabled: true
+  use_async: true

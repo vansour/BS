@@ -1,0 +1,38 @@
+# 训练配置文件
+# Training Configuration
+
+# 模型配置
+model:
+  yolo_weights: "yolo11s.pt"
+  num_fog_classes: 3
+  fog_class_names: ["clear", "uniform", "patchy"]
+
+# 训练超参数
+training:
+  batch_size: 16
+  epochs: 30
+  learning_rate: 1.0e-4
+  qat_epochs: 5
+  qat_learning_rate: 1.0e-5
+  img_size: 640
+
+# 物理参数（大气散射模型）
+physics:
+  beta_min: 0.02
+  beta_max: 0.1
+  a_min: 0.7
+  a_max: 0.95
+
+# 数据路径
+paths:
+  raw_data_dir: "data/UA-DETRAC/DETRAC-train-data/Insight-MVT_Annotation_Train"
+  depth_cache_dir: "outputs/Depth_Cache"
+  output_dir: "outputs/Fog_Detection_Project"
+
+# 设备配置
+device: "cuda"  # 或 "cpu"
+
+# 推理配置
+inference:
+  base_conf_thres: 0.25
+  ema_alpha: 0.1
