@@ -10,6 +10,13 @@ Unified Multi-Task Training Script
 4. QAT 量化感知训练阶段；
 5. INT8 模型转换与保存；
 6. 检查点续训与历史检查点清理。
+
+本模块是当前项目训练主线的真实入口。与许多“先离线生成增强数据再训练”的方案不同，
+本项目采用如下训练路径：
+清晰图像 + 深度缓存 + XML 检测框  ->  在线造雾  ->  多任务联合优化
+
+因此，本文件所组织的不仅是模型训练过程本身，还包括数据准备约定、损失函数组织方式、
+断点续训机制、QAT 量化训练以及最终 INT8 转换前的必要步骤。
 """
 
 import multiprocessing
@@ -20,7 +27,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from tqdm import tqdm
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,10 +48,17 @@ def build_cfg_snapshot(cfg: Config) -> dict:
 
     Returns:
         dict: 适合保存到 checkpoint 中的配置快照。
+
+    把关键训练配置写入 checkpoint 的好处是：
+    - 续训时更容易核对当前权重对应的训练条件；
+    - 后续追溯模型来源时，不必完全依赖 README 或人工记录；
+    - 即使配置类后续发生变化，也能保留当时训练时的主要超参数摘要。
     """
     return {
         "yolo_base_model": cfg.YOLO_BASE_MODEL,
         "num_det_classes": cfg.NUM_DET_CLASSES,
+        "det_train_class_id": cfg.DET_TRAIN_CLASS_ID,
+        "vehicle_class_ids": list(cfg.VEHICLE_CLASS_IDS),
         "num_fog_classes": cfg.NUM_FOG_CLASSES,
         "det_loss_weight": cfg.DET_LOSS_WEIGHT,
         "fog_cls_loss_weight": cfg.FOG_CLS_LOSS_WEIGHT,
@@ -56,6 +69,11 @@ def build_cfg_snapshot(cfg: Config) -> dict:
         "lr": cfg.LR,
         "qat_lr": cfg.QAT_LR,
         "img_size": cfg.IMG_SIZE,
+        "frame_stride": cfg.FRAME_STRIDE,
+        "precompute_depth_cache": cfg.PRECOMPUTE_DEPTH_CACHE,
+        "num_workers": cfg.NUM_WORKERS,
+        "prefetch_factor": cfg.PREFETCH_FACTOR,
+        "persistent_workers": cfg.PERSISTENT_WORKERS,
         "beta_min": cfg.BETA_MIN,
         "beta_max": cfg.BETA_MAX,
         "a_min": cfg.A_MIN,
@@ -72,9 +90,14 @@ def multitask_collate_fn(batch):
     - `batch_idx`
     - `cls`
     - `bboxes`
+
+    之所以不能简单 `torch.stack(det_boxes)`，是因为每张图的目标数量不同。
+    Ultralytics 的检测损失接口期望看到的是“所有目标拼在一起，再用 batch_idx
+    指明每个目标属于哪张图”的格式，这个函数正是在做这层适配。
     """
     imgs, depths, det_cls_list, det_box_list = zip(*batch)
 
+    # 图像和深度本身是固定尺寸张量，可以直接按 batch 维堆叠。
     imgs = torch.stack(imgs, 0)
     depths = torch.stack(depths, 0)
 
@@ -85,6 +108,8 @@ def multitask_collate_fn(batch):
     for sample_idx, (det_cls, det_boxes) in enumerate(zip(det_cls_list, det_box_list)):
         if det_boxes.numel() == 0:
             continue
+        # 为当前图像中的每个目标都记录一个所属样本索引，
+        # 供 Ultralytics loss 在 batch 内回溯目标归属。
         batch_idx_all.append(torch.full((det_boxes.shape[0],), sample_idx, dtype=torch.int64))
         cls_all.append(det_cls)
         bboxes_all.append(det_boxes)
@@ -96,6 +121,8 @@ def multitask_collate_fn(batch):
             "bboxes": torch.cat(bboxes_all, 0),
         }
     else:
+        # 整个 batch 都没有目标时，仍然返回结构完整的空张量，
+        # 避免下游检测损失接口因为键缺失或 shape 异常而报错。
         det_targets = {
             "batch_idx": torch.zeros((0,), dtype=torch.int64),
             "cls": torch.zeros((0,), dtype=torch.float32),
@@ -112,6 +139,9 @@ def prune_old_checkpoints(checkpoint_dir: str, keep_max: int):
     Args:
         checkpoint_dir: checkpoint 目录。
         keep_max: 最多保留多少个最新文件。
+
+    训练过程中如果每个 epoch 都保存 checkpoint，而从不清理，很快就会把磁盘写满。
+    这个函数用一个简单的“保留最近 N 个”策略控制目录体积。
     """
     if keep_max <= 0 or not os.path.isdir(checkpoint_dir):
         return
@@ -127,6 +157,7 @@ def prune_old_checkpoints(checkpoint_dir: str, keep_max: int):
     if len(checkpoint_files) <= keep_max:
         return
 
+    # 按修改时间从新到旧排序，再删除多余的旧文件。
     checkpoint_files.sort(key=lambda path: os.path.getmtime(path), reverse=True)
     for stale_path in checkpoint_files[keep_max:]:
         try:
@@ -136,7 +167,18 @@ def prune_old_checkpoints(checkpoint_dir: str, keep_max: int):
             print(f"Failed to remove old checkpoint {stale_path}: {exc}")
 
 
-def save_checkpoint(checkpoint_path, epoch, model, optimizer, scheduler, scaler, train_loss, best_loss, cfg):
+def save_checkpoint(
+    checkpoint_path,
+    epoch,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    train_loss,
+    best_loss,
+    cfg,
+    val_loss=None,
+):
     """
     保存训练 checkpoint。
 
@@ -150,6 +192,9 @@ def save_checkpoint(checkpoint_path, epoch, model, optimizer, scheduler, scaler,
         train_loss: 当前 epoch 平均训练损失。
         best_loss: 当前历史最佳损失。
         cfg: 当前配置对象。
+
+    这里保存的是“可恢复训练状态”的 checkpoint，而不是仅供推理使用的纯权重文件。
+    因此除了模型参数，还包含优化器、调度器、AMP scaler 和配置快照。
     """
     checkpoint = {
         "epoch": epoch,
@@ -159,6 +204,8 @@ def save_checkpoint(checkpoint_path, epoch, model, optimizer, scheduler, scaler,
         "best_loss": best_loss,
         "cfg_snapshot": build_cfg_snapshot(cfg),
     }
+    if val_loss is not None:
+        checkpoint["val_loss"] = val_loss
 
     if scheduler is not None:
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
@@ -183,6 +230,9 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scal
 
     Returns:
         tuple: `(start_epoch, train_loss, best_loss)`。
+
+    这里默认把 checkpoint 先加载到 CPU，再恢复到调用方的模型和优化器中。
+    这样做更稳妥，避免直接在 CUDA 上反序列化时受到设备环境影响。
     """
     if not os.path.exists(checkpoint_path):
         print(f"Checkpoint not found: {checkpoint_path}")
@@ -207,8 +257,34 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scal
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Resuming from epoch {start_epoch}")
     print(f"Previous train loss: {train_loss:.4f}")
+    if "val_loss" in checkpoint and checkpoint["val_loss"] is not None:
+        print(f"Previous val loss: {checkpoint['val_loss']:.4f}")
     print(f"Best loss: {best_loss:.4f}")
     return start_epoch, train_loss, best_loss
+
+
+def summarize_missing_depth_cache(dataset: MultiTaskDataset) -> tuple[int, list[str]]:
+    """
+    统计数据集中缺失的深度缓存数量，并返回少量样例文件名。
+
+    训练与验证都依赖深度缓存。若只检查训练集而忽略验证集，就会出现
+    “训练能跑完，第一个验证 batch 直接因缺缓存崩溃”的情况。
+    这里在构建 DataLoader 前统一盘点两边的缓存覆盖情况。
+    """
+    missing_count = 0
+    missing_examples: list[str] = []
+
+    for _, seq, img_name in dataset.samples:
+        depth_name = f"{seq}_{img_name}.npy"
+        depth_path = os.path.join(dataset.depth_cache_dir, depth_name)
+        if os.path.exists(depth_path):
+            continue
+
+        missing_count += 1
+        if len(missing_examples) < 5:
+            missing_examples.append(depth_name)
+
+    return missing_count, missing_examples
 
 
 def build_train_components(cfg: Config, device: str):
@@ -220,7 +296,14 @@ def build_train_components(cfg: Config, device: str):
         device: 当前运行设备。
 
     Returns:
-        tuple: 归一化变换、训练 DataLoader、分类损失、回归损失。
+        tuple: 归一化变换、训练 DataLoader、验证 DataLoader、分类损失、回归损失。
+
+    这个函数把“训练前固定准备工作”集中起来，避免 `train()` 主体里同时混杂：
+    - 变换定义；
+    - 数据集构建；
+    - 深度缓存补算；
+    - DataLoader 参数组织；
+    - 损失函数创建。
     """
     if cfg.USE_IMAGENET_NORMALIZE:
         mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
@@ -229,12 +312,8 @@ def build_train_components(cfg: Config, device: str):
         def normalize(batch):
             return (batch - mean.to(batch.device, batch.dtype)) / std.to(batch.device, batch.dtype)
     else:
+        # 保持接口一致：即便不做归一化，也返回一个可调用对象。
         normalize = nn.Identity()
-    transform = transforms.Compose([
-        transforms.Resize((cfg.IMG_SIZE, cfg.IMG_SIZE)),
-        transforms.ToTensor(),
-    ])
-
     if not os.path.isdir(cfg.XML_DIR):
         raise RuntimeError(f"Detection annotation directory was not found: {cfg.XML_DIR}")
 
@@ -242,30 +321,132 @@ def build_train_components(cfg: Config, device: str):
         cfg.RAW_DATA_DIR,
         cfg.DEPTH_CACHE_DIR,
         xml_dir=cfg.XML_DIR,
-        transform=transform,
+        transform=None,
         is_train=True,
+        frame_stride=cfg.FRAME_STRIDE,
+        det_train_class_id=cfg.DET_TRAIN_CLASS_ID,
+        img_size=cfg.IMG_SIZE,
+        keep_ratio=True,
+    )
+    val_ds = MultiTaskDataset(
+        cfg.RAW_DATA_DIR,
+        cfg.DEPTH_CACHE_DIR,
+        xml_dir=cfg.XML_DIR,
+        transform=None,
+        is_train=False,
+        frame_stride=cfg.FRAME_STRIDE,
+        det_train_class_id=cfg.DET_TRAIN_CLASS_ID,
+        img_size=cfg.IMG_SIZE,
+        keep_ratio=True,
     )
     if len(train_ds) == 0:
         raise RuntimeError(f"Training dataset is empty: {cfg.RAW_DATA_DIR}")
 
-    print(f"Training samples: {len(train_ds)}")
+    print(f"Training samples: {len(train_ds)} (frame_stride={cfg.FRAME_STRIDE})")
+    print(f"Validation samples: {len(val_ds)} (frame_stride={cfg.FRAME_STRIDE})")
 
-    # 训练正式开始前先确保深度缓存齐备，避免 batch 过程中频繁缺缓存。
-    precompute_depths(train_ds, device)
-
-    num_workers = 0 if os.name == "nt" else 4
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.BATCH_SIZE,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=device == "cuda",
-        collate_fn=multitask_collate_fn,
+    train_missing_count, train_missing_examples = summarize_missing_depth_cache(train_ds)
+    val_missing_count, val_missing_examples = (
+        summarize_missing_depth_cache(val_ds) if len(val_ds) > 0 else (0, [])
     )
 
+    print(
+        "Depth cache coverage: "
+        f"train missing={train_missing_count}, "
+        f"val missing={val_missing_count}"
+    )
+    if train_missing_examples:
+        print(f"Sample missing train depth files: {train_missing_examples}")
+    if val_missing_examples:
+        print(f"Sample missing val depth files: {val_missing_examples}")
+
+    # 当前策略改为：
+    # 1. 显式开启 BS_PRECOMPUTE_DEPTH_CACHE=1 时，总是先跑预计算流程；
+    # 2. 即使未显式开启，只要检测到 train/val 任一侧存在缺失缓存，也会自动补齐；
+    # 3. 只有两边缓存都完整时，才真正跳过预计算。
+    if cfg.PRECOMPUTE_DEPTH_CACHE or train_missing_count > 0 or val_missing_count > 0:
+        if cfg.PRECOMPUTE_DEPTH_CACHE:
+            print("Depth cache precomputation is forced by BS_PRECOMPUTE_DEPTH_CACHE.")
+        else:
+            print("Missing depth cache files were detected. Auto-precomputing train/val depth cache.")
+
+        if train_missing_count > 0 or cfg.PRECOMPUTE_DEPTH_CACHE:
+            precompute_depths(train_ds, device)
+        if len(val_ds) > 0 and (val_missing_count > 0 or cfg.PRECOMPUTE_DEPTH_CACHE):
+            precompute_depths(val_ds, device)
+    else:
+        print("Depth cache is already complete for both training and validation datasets.")
+
+    # DataLoader 的几个关键选项：
+    # - shuffle=True：训练阶段打乱样本顺序；
+    # - pin_memory：CUDA 下加快主机到设备的数据传输；
+    # - collate_fn：把不定长检测框整理成 Ultralytics 期望的格式。
+    loader_kwargs = {
+        "batch_size": cfg.BATCH_SIZE,
+        "shuffle": True,
+        "num_workers": cfg.NUM_WORKERS,
+        "pin_memory": device == "cuda",
+        "collate_fn": multitask_collate_fn,
+    }
+    if cfg.NUM_WORKERS > 0:
+        loader_kwargs["persistent_workers"] = cfg.PERSISTENT_WORKERS
+        loader_kwargs["prefetch_factor"] = cfg.PREFETCH_FACTOR
+
+    print(
+        "DataLoader config: "
+        f"num_workers={cfg.NUM_WORKERS}, "
+        f"persistent_workers={loader_kwargs.get('persistent_workers', False)}, "
+        f"prefetch_factor={loader_kwargs.get('prefetch_factor', 'n/a')}"
+    )
+
+    train_loader = DataLoader(train_ds, **loader_kwargs)
+
+    val_loader = None
+    if len(val_ds) > 0:
+        val_loader_kwargs = dict(loader_kwargs)
+        val_loader_kwargs["shuffle"] = False
+        val_loader = DataLoader(val_ds, **val_loader_kwargs)
+
+    # 当前雾分类使用标准交叉熵，beta 回归使用均方误差。
     criterion_cls = nn.CrossEntropyLoss()
     criterion_reg = nn.MSELoss()
-    return normalize, train_loader, criterion_cls, criterion_reg
+    return normalize, train_loader, val_loader, criterion_cls, criterion_reg
+
+
+def compute_multitask_losses(
+    model,
+    imgs_norm,
+    det_targets,
+    cls_labels,
+    reg_labels,
+    criterion_cls,
+    criterion_reg,
+    cfg,
+    device,
+):
+    """
+    统一计算检测、雾分类和 beta 回归损失。
+    """
+    # 验证阶段模型处于 eval()，但 detection loss 仍需要训练态那类原始检测输出结构。
+    # 因此这里显式要求模型返回 raw detection preds，而不是推理用的后处理张量。
+    det_preds, pred_cls, pred_reg = model(imgs_norm, return_raw_det=True)
+    det_batch = {
+        "img": imgs_norm,
+        "batch_idx": det_targets["batch_idx"].to(device),
+        "cls": det_targets["cls"].to(device),
+        "bboxes": det_targets["bboxes"].to(device),
+    }
+
+    det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
+    loss_det = det_loss_components.sum() / max(imgs_norm.size(0), 1)
+    loss_cls = criterion_cls(pred_cls, cls_labels)
+    loss_reg = criterion_reg(pred_reg * cfg.BETA_MAX, reg_labels)
+    loss = (
+        cfg.DET_LOSS_WEIGHT * loss_det
+        + cfg.FOG_CLS_LOSS_WEIGHT * loss_cls
+        + cfg.FOG_REG_LOSS_WEIGHT * loss_reg
+    )
+    return loss, loss_det, loss_cls, loss_reg
 
 
 def train_epoch(
@@ -299,6 +480,13 @@ def train_epoch(
 
     Returns:
         float: 当前 epoch 的平均训练损失。
+
+    单个 batch 的真实计算链路是：
+    1. 把清晰图和深度图搬到目标设备；
+    2. 用 FogAugmentation 在线生成雾图、雾类别标签和 beta 标签；
+    3. 把雾图送入统一模型，得到检测输出、分类输出和回归输出；
+    4. 分别计算检测、分类和回归损失；
+    5. 按权重求和后反向传播。
     """
     model.train()
     total_loss = 0.0
@@ -309,6 +497,7 @@ def train_epoch(
         depths = depths.to(device)
 
         # 在线生成雾天样本，得到分类标签和回归标签。
+        # 这里放在 no_grad() 中，是因为增强参数不是可学习参数，不需要保留梯度图。
         with torch.no_grad():
             imgs_foggy, cls_labels, reg_labels = fog_augmenter(imgs, depths)
             imgs_norm = normalize(imgs_foggy)
@@ -317,47 +506,38 @@ def train_epoch(
 
         # 在 CUDA 环境下优先启用 AMP，以降低显存压力并提升吞吐。
         if scaler is not None:
-            with torch.cuda.amp.autocast():
-                det_preds, pred_cls, pred_reg = model(imgs_norm)
-                det_batch = {
-                    "img": imgs_norm,
-                    "batch_idx": det_targets["batch_idx"].to(device),
-                    "cls": det_targets["cls"].to(device),
-                    "bboxes": det_targets["bboxes"].to(device),
-                }
-                det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
-                loss_det = det_loss_components.sum() / max(imgs_norm.size(0), 1)
-                loss_cls = criterion_cls(pred_cls, cls_labels)
-                loss_reg = criterion_reg(pred_reg * cfg.BETA_MAX, reg_labels)
-                loss = (
-                    cfg.DET_LOSS_WEIGHT * loss_det
-                    + cfg.FOG_CLS_LOSS_WEIGHT * loss_cls
-                    + cfg.FOG_REG_LOSS_WEIGHT * loss_reg
+            with torch.amp.autocast("cuda"):
+                loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                    model,
+                    imgs_norm,
+                    det_targets,
+                    cls_labels,
+                    reg_labels,
+                    criterion_cls,
+                    criterion_reg,
+                    cfg,
+                    device,
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            det_preds, pred_cls, pred_reg = model(imgs_norm)
-            det_batch = {
-                "img": imgs_norm,
-                "batch_idx": det_targets["batch_idx"].to(device),
-                "cls": det_targets["cls"].to(device),
-                "bboxes": det_targets["bboxes"].to(device),
-            }
-            det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
-            loss_det = det_loss_components.sum() / max(imgs_norm.size(0), 1)
-            loss_cls = criterion_cls(pred_cls, cls_labels)
-            loss_reg = criterion_reg(pred_reg * cfg.BETA_MAX, reg_labels)
-            loss = (
-                cfg.DET_LOSS_WEIGHT * loss_det
-                + cfg.FOG_CLS_LOSS_WEIGHT * loss_cls
-                + cfg.FOG_REG_LOSS_WEIGHT * loss_reg
+            loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                model,
+                imgs_norm,
+                det_targets,
+                cls_labels,
+                reg_labels,
+                criterion_cls,
+                criterion_reg,
+                cfg,
+                device,
             )
             loss.backward()
             optimizer.step()
 
         total_loss += loss.item()
+        # 进度条里同时展示总损失和三项子损失，便于快速判断哪一项在主导训练。
         pbar.set_postfix({
             "loss": f"{loss.item():.4f}",
             "det": f"{loss_det.item():.4f}",
@@ -368,6 +548,78 @@ def train_epoch(
     return total_loss / max(len(train_loader), 1)
 
 
+def validate_epoch(
+    model,
+    fog_augmenter,
+    val_loader,
+    normalize,
+    criterion_cls,
+    criterion_reg,
+    cfg,
+    device,
+    desc,
+):
+    """
+    执行单个验证 epoch，并使用固定随机种子稳定在线造雾结果。
+    """
+    if val_loader is None:
+        return None
+
+    model.eval()
+    total_loss = 0.0
+    pbar = tqdm(val_loader, desc=desc)
+    fork_devices = [torch.cuda.current_device()] if device == "cuda" else []
+
+    with torch.random.fork_rng(devices=fork_devices):
+        torch.manual_seed(1234)
+        if device == "cuda":
+            torch.cuda.manual_seed_all(1234)
+
+        with torch.no_grad():
+            for imgs, depths, det_targets in pbar:
+                imgs = imgs.to(device)
+                depths = depths.to(device)
+
+                imgs_foggy, cls_labels, reg_labels = fog_augmenter(imgs, depths)
+                imgs_norm = normalize(imgs_foggy)
+
+                if device == "cuda":
+                    with torch.amp.autocast("cuda"):
+                        loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                            model,
+                            imgs_norm,
+                            det_targets,
+                            cls_labels,
+                            reg_labels,
+                            criterion_cls,
+                            criterion_reg,
+                            cfg,
+                            device,
+                        )
+                else:
+                    loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                        model,
+                        imgs_norm,
+                        det_targets,
+                        cls_labels,
+                        reg_labels,
+                        criterion_cls,
+                        criterion_reg,
+                        cfg,
+                        device,
+                    )
+
+                total_loss += loss.item()
+                pbar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "det": f"{loss_det.item():.4f}",
+                    "fog_cls": f"{loss_cls.item():.4f}",
+                    "fog_reg": f"{loss_reg.item():.4f}",
+                })
+
+    return total_loss / max(len(val_loader), 1)
+
+
 def train():
     """
     训练主入口。
@@ -375,6 +627,15 @@ def train():
     训练流程分为两个阶段：
     1. FP32 常规训练；
     2. QAT 量化感知训练与最终 INT8 转换。
+
+    整体执行顺序如下：
+    - 初始化配置、随机种子、模型和增强器；
+    - 构建训练集与 DataLoader；
+    - 尝试从最近 checkpoint 续训；
+    - 完成 FP32 主训练；
+    - 保存最终 FP32 权重；
+    - 切入 QAT；
+    - 做少量校准并尝试转换成 INT8。
     """
     try:
         multiprocessing.set_start_method("spawn", force=True)
@@ -398,11 +659,11 @@ def train():
     os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
 
-    normalize, train_loader, criterion_cls, criterion_reg = build_train_components(cfg, device)
+    normalize, train_loader, val_loader, criterion_cls, criterion_reg = build_train_components(cfg, device)
 
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LR)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
-    scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
     if scaler is not None:
         print("AMP is enabled.")
 
@@ -426,9 +687,8 @@ def train():
             start_epoch = 0
             best_loss = float("inf")
         if start_epoch >= cfg.EPOCHS:
-            print("Training already reached the configured epoch count, restarting from epoch 0.")
-            start_epoch = 0
-            best_loss = float("inf")
+            print("FP32 training already reached the configured epoch count, skipping FP32 stage.")
+            start_epoch = cfg.EPOCHS
     else:
         print("Starting training from scratch.")
 
@@ -448,6 +708,25 @@ def train():
             desc=f"Epoch {epoch + 1}/{cfg.EPOCHS}",
         )
         print(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
+        avg_val_loss = validate_epoch(
+            model,
+            fog_augmenter,
+            val_loader,
+            normalize,
+            criterion_cls,
+            criterion_reg,
+            cfg,
+            device,
+            desc=f"Val {epoch + 1}/{cfg.EPOCHS}",
+        )
+        if avg_val_loss is not None:
+            print(f"Epoch {epoch + 1} validation loss: {avg_val_loss:.4f}")
+
+        monitored_loss = avg_val_loss if avg_val_loss is not None else avg_loss
+        if monitored_loss < best_loss:
+            best_loss = monitored_loss
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Saved best model: {best_model_path}")
 
         # 按固定间隔保存 checkpoint，并清理更旧的历史文件。
         if (epoch + 1) % cfg.CHECKPOINT_SAVE_INTERVAL == 0:
@@ -462,13 +741,9 @@ def train():
                 avg_loss,
                 best_loss,
                 cfg,
+                val_loss=avg_val_loss,
             )
             prune_old_checkpoints(cfg.CHECKPOINT_DIR, cfg.CHECKPOINT_KEEP_MAX)
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), best_model_path)
-            print(f"Saved best model: {best_model_path}")
 
         scheduler.step()
 
@@ -483,6 +758,7 @@ def train():
     os.makedirs(qat_checkpoint_dir, exist_ok=True)
 
     # QAT 前先切回 CPU 进行融合与量化配置，再迁回目标设备。
+    # PyTorch 的某些量化准备步骤在 CPU 上更稳妥。
     model.to("cpu")
     model.fuse_model()
 
@@ -493,7 +769,11 @@ def train():
 
     optimizer_qat = optim.AdamW(model.parameters(), lr=cfg.QAT_LR)
     scheduler_qat = optim.lr_scheduler.CosineAnnealingLR(optimizer_qat, T_max=cfg.QAT_EPOCHS)
-    scaler_qat = torch.cuda.amp.GradScaler() if device == "cuda" else None
+    # QAT 不与 AMP 混用。
+    # fake quant / observer 通常要求 float32 路径，和 autocast 的半精度前向容易产生 dtype 冲突。
+    scaler_qat = None
+    if device == "cuda":
+        print("AMP is disabled during QAT to avoid fake-quant dtype mismatch.")
 
     qat_latest_checkpoint = find_latest_checkpoint(qat_checkpoint_dir)
     qat_start_epoch = 0
@@ -531,6 +811,23 @@ def train():
             desc=f"QAT Epoch {epoch + 1}/{cfg.QAT_EPOCHS}",
         )
         print(f"QAT epoch {epoch + 1} average loss: {avg_loss:.4f}")
+        avg_val_loss = validate_epoch(
+            model,
+            fog_augmenter,
+            val_loader,
+            normalize,
+            criterion_cls,
+            criterion_reg,
+            cfg,
+            device,
+            desc=f"QAT Val {epoch + 1}/{cfg.QAT_EPOCHS}",
+        )
+        if avg_val_loss is not None:
+            print(f"QAT epoch {epoch + 1} validation loss: {avg_val_loss:.4f}")
+
+        monitored_loss = avg_val_loss if avg_val_loss is not None else avg_loss
+        if monitored_loss < best_loss_qat:
+            best_loss_qat = monitored_loss
 
         qat_checkpoint_path = os.path.join(qat_checkpoint_dir, f"checkpoint_epoch_{epoch + 1:04d}.pt")
         save_checkpoint(
@@ -543,11 +840,9 @@ def train():
             avg_loss,
             best_loss_qat,
             cfg,
+            val_loss=avg_val_loss,
         )
         prune_old_checkpoints(qat_checkpoint_dir, cfg.CHECKPOINT_KEEP_MAX)
-
-        if avg_loss < best_loss_qat:
-            best_loss_qat = avg_loss
 
         # QAT 后半程逐步冻结 observer 和 fake quant，稳定量化参数。
         if epoch > 2:
@@ -562,6 +857,7 @@ def train():
     model.apply(torch.ao.quantization.enable_observer)
 
     # 进行少量校准前向，尽量让 observer 拿到更合理的激活范围。
+    # 这里只取少量 batch 做快速校准，目的不是重新训练，而是补全量化统计信息。
     print("Running QAT calibration.")
     model.eval()
     with torch.no_grad():

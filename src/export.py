@@ -5,6 +5,11 @@ Model Export Script
 
 本模块负责把训练好的统一多任务模型导出为 ONNX，并给出 TensorRT INT8 构建
 示例和 Jetson 部署建议，方便后续在边缘设备上完成部署验证。
+
+本文件的定位并非完整部署框架，而是面向部署准备阶段的辅助工具，主要负责：
+- 将当前 PyTorch 模型稳定导出为 ONNX；
+- 提供 TensorRT INT8 引擎构建的参考代码；
+- 给出 Jetson 平台部署验证时的若干注意事项。
 """
 
 import os
@@ -39,6 +44,13 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
         weights_path: 待加载的权重文件路径；若为空或不存在，则使用随机初始化权重导出。
         onnx_path: 导出的 ONNX 文件保存路径。
         device: 导出时使用的设备，默认是 CPU。
+
+    当前导出的是统一模型的三路输出：
+    - 检测输出；
+    - 雾分类输出；
+    - beta 回归输出。
+
+    这意味着后续部署侧不仅要做检测后处理，也要接住分类和回归两个分支。
     """
     if onnx is None:
         raise ImportError("ONNX export requires the 'onnx' package. Install it with `pip install onnx`.")
@@ -51,8 +63,12 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
     )
 
     # 如有可用权重，则优先加载训练好的模型参数；否则允许导出随机初始化版本。
+    # 后者主要用于图结构验证或部署链路联调，不适合作为真实效果模型。
     if weights_path and os.path.exists(weights_path):
         report = load_model_weights(model, weights_path, map_location=device)
+        skipped_yolo_keys = [
+            key for key in report.get("skipped_mismatched_keys", []) if key.startswith("yolo.")
+        ]
         print(f"Loaded weights from: {weights_path} ({report['source_type']})")
         if report["missing_keys"] or report["unexpected_keys"]:
             print(
@@ -61,6 +77,12 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
             )
         if report.get("skipped_mismatched_keys"):
             print(f"Skipped mismatched keys: {len(report['skipped_mismatched_keys'])}")
+        if skipped_yolo_keys:
+            print(
+                "Detection head class-count mismatch detected. "
+                "The exported ONNX graph will use the current single-class model definition, "
+                "but box quality requires a checkpoint re-trained with `NUM_DET_CLASSES = 1`."
+            )
     else:
         print(f"Weights were not found at {weights_path}, exporting with random initialization.")
 
@@ -80,6 +102,7 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
         dynamo=False,
         input_names=["images"],
         output_names=["output0", "fog_cls", "fog_reg"],
+        # 仅 batch 维保持动态，空间尺寸当前仍固定为训练输入尺寸。
         dynamic_axes={
             "images": {0: "batch_size"},
             "output0": {0: "batch_size"},
@@ -96,8 +119,12 @@ def get_trt_int8_config_example():
 
     Returns:
         str: 可直接参考的 TensorRT Python API 示例。
+
+    这里返回字符串而不是直接执行，是因为 TensorRT 环境通常与当前开发机环境不同，
+    更适合把示例打印出来，交给目标部署环境参考执行。
     """
-    code_snippet = '''
+    cfg = Config()
+    code_snippet = f'''
 import tensorrt as trt
 
 def build_int8_engine(onnx_file_path, engine_file_path):
@@ -122,7 +149,7 @@ def build_int8_engine(onnx_file_path, engine_file_path):
         config.set_flag(trt.BuilderFlag.FP16)
 
     profile = builder.create_optimization_profile()
-    profile.set_shape("images", (1, 3, 640, 640), (4, 3, 640, 640), (8, 3, 640, 640))
+    profile.set_shape("images", (1, 3, {cfg.IMG_SIZE}, {cfg.IMG_SIZE}), (4, 3, {cfg.IMG_SIZE}, {cfg.IMG_SIZE}), (8, 3, {cfg.IMG_SIZE}, {cfg.IMG_SIZE}))
     config.add_optimization_profile(profile)
 
     engine_bytes = builder.build_serialized_network(network, config)

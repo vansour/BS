@@ -10,6 +10,12 @@ Dataset Preparer
 3. 按视频序列划分训练集和验证集；
 4. 拷贝对应图像并生成标签文件；
 5. 生成 `data.yaml` 配置文件。
+
+本模块属于离线辅助链路，与当前“在线造雾 + 多任务联合训练”的主流程不同。
+其主要价值在于：
+1. 构造独立 YOLO 检测实验所需的数据集；
+2. 快速核查离线雾图与标注是否对齐；
+3. 为只做检测任务的对比实验提供标准目录结构。
 """
 
 import os
@@ -28,6 +34,8 @@ class DatasetPreparer:
 
     该类把“从原始标注到训练目录”的完整流程集中管理，便于在离线数据准备阶段
     一次性执行全部转换步骤，并统计最终的训练/验证样本规模。
+
+    当前实现默认将所有目标统一映射为单一类别 `vehicle`，与项目现阶段的检测设置保持一致。
     """
 
     def __init__(self, xml_dir, foggy_image_root, output_dataset_dir, train_ratio=0.8):
@@ -39,6 +47,8 @@ class DatasetPreparer:
             foggy_image_root: 已生成雾天图像的根目录，内部包含多个 `*_Foggy` 子目录。
             output_dataset_dir: 输出的 YOLO 数据集根目录。
             train_ratio: 训练集所占的视频序列比例。
+
+        `stats` 用于累计最终转换结果，以便在流程结束后输出清晰的样本统计摘要。
         """
         self.xml_dir = xml_dir
         self.foggy_image_root = foggy_image_root
@@ -64,6 +74,8 @@ class DatasetPreparer:
 
         Returns:
             tuple: `(x_center, y_center, w, h)`，都已经归一化到 `[0, 1]`。
+
+        这是把 UA-DETRAC 风格的左上角坐标框转成 YOLO 风格中心点框的标准步骤。
         """
         dw = 1.0 / size[0]
         dh = 1.0 / size[1]
@@ -82,6 +94,9 @@ class DatasetPreparer:
 
         Returns:
             dict: 结构为 `{frame_num: [objects]}`，其中每个 object 至少包含 `bbox` 字段。
+
+        这里将每帧解析为“对象列表”而非仅保留 bbox 数组，
+        主要是为了给未来扩展目标属性字段保留结构空间。
         """
         tree = ET.parse(xml_file)
         root = tree.getroot()
@@ -121,6 +136,9 @@ class DatasetPreparer:
             - `images/val`
             - `labels/train`
             - `labels/val`
+
+        这是 Ultralytics YOLO 最常见的数据集目录布局之一，
+        后续可以直接配合生成的 `data.yaml` 使用。
         """
         for sub in ["images/train", "images/val", "labels/train", "labels/val"]:
             os.makedirs(os.path.join(self.output_dir, sub), exist_ok=True)
@@ -130,6 +148,9 @@ class DatasetPreparer:
         执行完整的数据集转换流程。
 
         流程包括目录构建、序列划分、图像拷贝、标签写入和统计输出。
+
+        这里采用“序列级”而非“帧级”划分 train/val，
+        以避免同一视频中的相邻帧同时进入训练集和验证集，造成评估泄漏。
         """
         self.create_structure()
 
@@ -138,6 +159,7 @@ class DatasetPreparer:
             return
 
         # 收集所有已经生成好的雾天序列目录。
+        # 这些目录名默认形如 `MVI_xxx_Foggy`，后面会通过去掉 `_Foggy` 找到原 XML 名称。
         foggy_folders = [
             d for d in os.listdir(self.foggy_image_root)
             if os.path.isdir(os.path.join(self.foggy_image_root, d))
@@ -176,6 +198,7 @@ class DatasetPreparer:
                 continue
 
             # 通过第一张图像读取原始尺寸，后续所有标签都按这个尺寸归一化。
+            # 这里假定同一序列中图像尺寸一致，这与常见视频序列数据组织相符。
             test_img = cv2.imread(os.path.join(foggy_seq_path, foggy_images[0]))
             if test_img is None:
                 continue
@@ -207,6 +230,7 @@ class DatasetPreparer:
                 if not label_lines:
                     continue
 
+                # 图像和标签分别写入标准 YOLO 目录。
                 shutil.copy(
                     os.path.join(foggy_seq_path, img_file),
                     os.path.join(self.output_dir, "images", subset, img_file),
@@ -245,13 +269,14 @@ class DatasetPreparer:
 
         当前任务只保留一个检测类别：`vehicle`。
         """
-        yaml_content = f"""path: {os.path.abspath(self.output_dir)}
-train: images/train
-val: images/val
-nc: 1
-names: ['vehicle']
-"""
+        # path 使用绝对路径，避免从不同工作目录启动 YOLO 训练时路径解析混乱。
+        yaml_content = "\n".join([
+            f"path: {os.path.abspath(self.output_dir)}",
+            "train: images/train",
+            "val: images/val",
+            "nc: 1",
+            "names: ['vehicle']",
+        ]) + "\n"
         with open(os.path.join(self.output_dir, "data.yaml"), "w", encoding="utf-8") as f:
             f.write(yaml_content)
-
 

@@ -9,6 +9,12 @@ Highway Fog Monitoring Inference Script
 3. 执行雾类型分类与 beta 推理；
 4. 结合 EMA 平滑结果动态调整检测置信度提示；
 5. 以可视化界面的方式展示运行状态。
+
+与训练脚本相比，本模块更强调运行时工程组织能力，主要解决以下问题：
+- 如何解析并加载最合适的模型权重；
+- 如何对视频帧进行规范化预处理；
+- 如何完成检测后处理与动态阈值调节；
+- 如何将结果组织为可演示的实时可视化界面。
 """
 
 import os
@@ -18,10 +24,7 @@ from typing import Optional, Tuple, Union
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from torchvision import transforms
 from ultralytics.utils.nms import non_max_suppression
-from ultralytics.utils.ops import scale_boxes
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
@@ -29,7 +32,12 @@ if project_root not in sys.path:
 
 from src.config import Config
 from src.model import UnifiedMultiTaskModel
-from src.utils import load_model_weights, resolve_model_weights
+from src.utils import (
+    invert_letterbox_boxes_xyxy,
+    letterbox_tensor,
+    load_model_weights,
+    resolve_model_weights,
+)
 
 
 class HighwayFogSystem:
@@ -42,6 +50,8 @@ class HighwayFogSystem:
     - GPU 多流推理；
     - 输出后处理；
     - 实时界面显示。
+
+    从设计定位上看，该类更接近“运行时系统封装”，而非单纯的 `predict()` 包装器。
     """
 
     FOG_CLASS_NAMES = ["CLEAR", "UNIFORM FOG", "PATCHY FOG"]
@@ -56,6 +66,12 @@ class HighwayFogSystem:
             model_path: 指定权重路径；若为空或不存在，则自动回退到默认导出路径。
             video_source: 视频源，可以是摄像头编号，也可以是视频文件路径。
             cfg: 可选配置对象；若不提供，则创建默认配置。
+
+        初始化时除了模型本身，还会准备：
+        - 图像变换流程；
+        - CUDA 三段异步流；
+        - 视频读取器；
+        - beta 平滑状态。
         """
         self.cfg = cfg or Config()
         self.device = self.cfg.DEVICE
@@ -70,16 +86,15 @@ class HighwayFogSystem:
         self._load_model()
         self.model.to(self.device).eval()
 
-        # 推理阶段的图像预处理流程，与训练阶段的输入规范保持一致。
-        transform_steps = [
-            transforms.Resize((self.cfg.IMG_SIZE, self.cfg.IMG_SIZE)),
-            transforms.ToTensor(),
-        ]
+        # 推理阶段直接在张量层执行 letterbox，与训练阶段保持同样的几何约束。
+        self.input_mean = None
+        self.input_std = None
         if self.cfg.USE_IMAGENET_NORMALIZE:
-            transform_steps.append(transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))
-        self.transform = transforms.Compose(transform_steps)
+            self.input_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+            self.input_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
         # 若 GPU 可用，则启用预处理 / 推理 / 后处理三阶段流并行。
+        # 这并不意味着每一步都完全并行，但可以让不同阶段尽量形成流水线。
         if self.device == "cuda":
             print("CUDA detected, enabling asynchronous pipeline streams.")
             self.preprocess_stream = torch.cuda.Stream()
@@ -106,6 +121,11 @@ class HighwayFogSystem:
 
         Returns:
             Optional[str]: 可用权重路径；若都找不到，则返回原始请求值或 `None`。
+
+        路径解析优先级是：
+        1. 调用方显式给出的存在路径；
+        2. `OUTPUT_DIR` 中的正式导出权重；
+        3. checkpoint 目录里的最新权重。
         """
         if requested_path and os.path.exists(requested_path):
             return requested_path
@@ -113,7 +133,7 @@ class HighwayFogSystem:
         fallback = resolve_model_weights(
             self.cfg.OUTPUT_DIR,
             self.cfg.CHECKPOINT_DIR,
-            preferred_files=["unified_model.pt", "unified_model_best.pt"],
+            preferred_files=["unified_model_best.pt", "unified_model.pt"],
         )
         if fallback and fallback != requested_path:
             print(f"Requested weights were not found, falling back to: {fallback}")
@@ -125,11 +145,17 @@ class HighwayFogSystem:
 
         找不到可用权重时不会直接报错退出，而是保留随机初始化权重，
         这样至少可以进行链路级联调或空跑验证。
+
+        这在项目中期开发阶段很有用，因为即使训练权重还未完全准备好，
+        推理链路、UI、后处理逻辑仍然可以先做烟雾测试。
         """
         if self.model_path and os.path.exists(self.model_path):
             print(f"Loading model weights from: {self.model_path}")
             try:
                 report = load_model_weights(self.model, self.model_path, map_location=self.device)
+                skipped_yolo_keys = [
+                    key for key in report.get("skipped_mismatched_keys", []) if key.startswith("yolo.")
+                ]
                 print(f"Weights loaded successfully ({report['source_type']}).")
                 if report["missing_keys"] or report["unexpected_keys"]:
                     print(
@@ -138,13 +164,23 @@ class HighwayFogSystem:
                     )
                 if report.get("skipped_mismatched_keys"):
                     print(f"Skipped mismatched keys: {len(report['skipped_mismatched_keys'])}")
+                if skipped_yolo_keys:
+                    print(
+                        "Detection head class-count mismatch detected. "
+                        "The current checkpoint was trained with a different `NUM_DET_CLASSES`; "
+                        "single-class inference will need a re-trained single-class checkpoint."
+                    )
                 return
             except Exception as exc:
                 print(f"Failed to load weights ({exc}), using randomly initialized weights.")
 
         print("No usable weights were found, using randomly initialized weights.")
 
-    def _preprocess_async(self, frame: np.ndarray, stream: Optional[torch.cuda.Stream] = None) -> torch.Tensor:
+    def _preprocess_async(
+        self,
+        frame: np.ndarray,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> tuple[torch.Tensor, dict[str, object]]:
         """
         异步或同步地完成图像预处理。
 
@@ -153,16 +189,24 @@ class HighwayFogSystem:
             stream: 可选 CUDA 流；若提供则在该流上执行预处理。
 
         Returns:
-            torch.Tensor: 模型可直接使用的输入张量。
+            tuple[torch.Tensor, dict[str, object]]: 模型输入张量与当前帧的 letterbox 元数据。
+
+        输入视频帧来自 OpenCV，默认是 BGR；而 PIL / torchvision 习惯使用 RGB，
+        因此这里首先会做一次颜色空间转换。
         """
         def process():
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-            img_tensor = self.transform(pil_img).unsqueeze(0)
+            img_tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0)
+            img_tensor, letterbox_meta = letterbox_tensor(img_tensor, self.cfg.IMG_SIZE)
+            if self.input_mean is not None and self.input_std is not None:
+                img_tensor = (img_tensor - self.input_mean) / self.input_std
+            img_tensor = img_tensor.unsqueeze(0)
             if self.device == "cuda":
-                return img_tensor.to(self.device, non_blocking=True)
-            return img_tensor
+                return img_tensor.to(self.device, non_blocking=True), letterbox_meta
+            return img_tensor, letterbox_meta
 
+        # 如果提供了 CUDA stream，就在该 stream 上提交预处理；
+        # 否则退化为同步执行。
         if stream is not None:
             with torch.cuda.stream(stream):
                 return process()
@@ -183,6 +227,9 @@ class HighwayFogSystem:
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 检测输出、雾分类 logits 和 beta 回归结果。
+
+        模型本身已经被置为 `eval()`，这里再配合 `torch.no_grad()`，
+        以避免推理阶段构建不必要的梯度图。
         """
         if stream is not None:
             with torch.cuda.stream(stream):
@@ -207,6 +254,11 @@ class HighwayFogSystem:
         Returns:
             Tuple[np.ndarray, float, torch.Tensor]:
                 雾分类概率、映射后的 beta 值以及经过 NMS 的检测结果。
+
+        这里完成的是“模型输出到业务可消费结果”的转换：
+        - logits -> softmax 概率；
+        - 归一化 beta -> 实际 beta；
+        - 原始检测输出 -> NMS 后候选框。
         """
         def process():
             det_out, logits, beta_tensor = outputs
@@ -215,6 +267,7 @@ class HighwayFogSystem:
 
             # 推理阶段先用较低阈值做一次 NMS，尽量保留候选框，
             # 后续再根据平滑后的 beta 动态过滤显示阈值。
+            # 这相当于把“几何去重”和“显示保留策略”分成两个阶段。
             det_batches = non_max_suppression(
                 det_out,
                 conf_thres=0.05,
@@ -223,12 +276,28 @@ class HighwayFogSystem:
                 max_det=100,
             )
             detections = det_batches[0].detach().cpu() if det_batches else torch.zeros((0, 6))
+            detections = self._merge_vehicle_detections(detections)
             return probs, beta, detections
 
         if stream is not None:
             with torch.cuda.stream(stream):
                 return process()
         return process()
+
+    def _merge_vehicle_detections(self, detections: torch.Tensor) -> torch.Tensor:
+        """
+        将检测结果统一整理为单类 `vehicle`。
+
+        在当前单类配置下，NMS 后的类别 id 理论上就只有 `0`。
+        这里保留一个轻量归一化步骤，是为了兼容旧结果或边界情况，
+        确保绘制逻辑始终看到统一的 `vehicle` 类别编号。
+        """
+        if detections.numel() == 0:
+            return detections
+
+        vehicle_detections = detections.clone()
+        vehicle_detections[:, 5] = 0.0
+        return vehicle_detections
 
     def predict(self, frame: np.ndarray) -> Tuple[np.ndarray, float, torch.Tensor]:
         """
@@ -240,8 +309,11 @@ class HighwayFogSystem:
         Returns:
             Tuple[np.ndarray, float, torch.Tensor]:
                 概率向量、beta 值以及经过 NMS 的检测结果。
+
+        这是最适合被外部脚本直接调用的同步接口。
+        如果不需要完整视频循环和 UI，只需要单帧结果，就走这里。
         """
-        img_tensor = self._preprocess_async(frame)
+        img_tensor, _ = self._preprocess_async(frame)
         outputs = self._inference_async(img_tensor)
         return self._postprocess_async(outputs)
 
@@ -251,6 +323,7 @@ class HighwayFogSystem:
         detections: torch.Tensor,
         adaptive_conf: float,
         fog_idx: int,
+        preprocess_meta: dict[str, object],
     ) -> tuple[np.ndarray, int]:
         """
         在显示帧上绘制检测框。
@@ -260,26 +333,33 @@ class HighwayFogSystem:
             detections: NMS 后检测结果，格式为 `[x1, y1, x2, y2, conf, cls]`。
             adaptive_conf: 动态置信度阈值。
             fog_idx: 当前雾类型索引，用于选择显示颜色。
+            preprocess_meta: 当前帧输入阶段的 letterbox 元数据。
 
         Returns:
             tuple:
                 - 绘制后的帧
                 - 最终被展示的检测框数量
+
+        注意这里绘制的是“已经经过第二次动态阈值过滤”的框，不是 NMS 后的全部候选框。
+        因此最终展示数量会随着雾浓度估计而变化。
         """
         if detections.numel() == 0:
+            return frame, 0
+
+        if preprocess_meta is None:
             return frame, 0
 
         display_boxes = detections[detections[:, 4] >= adaptive_conf]
         if display_boxes.numel() == 0:
             return frame, 0
 
-        boxes = display_boxes[:, :4].clone()
-        boxes = scale_boxes(
-            (self.cfg.IMG_SIZE, self.cfg.IMG_SIZE),
-            boxes,
-            frame.shape[:2],
-            padding=False,
-        )
+        # 检测框当前还处于 letterbox 输入坐标系，需要先还原到原始帧，
+        # 再根据展示分辨率做一次线性映射。
+        boxes = invert_letterbox_boxes_xyxy(display_boxes[:, :4], preprocess_meta)
+        src_h, src_w = preprocess_meta["src_shape"]
+        frame_h, frame_w = frame.shape[:2]
+        boxes[:, [0, 2]] *= frame_w / max(src_w, 1)
+        boxes[:, [1, 3]] *= frame_h / max(src_h, 1)
 
         box_color = self.DETECTION_COLORS[min(fog_idx, len(self.DETECTION_COLORS) - 1)]
         for box, det in zip(boxes, display_boxes):
@@ -301,6 +381,9 @@ class HighwayFogSystem:
 
         按 `Q` 键可以退出。若设备支持 CUDA，则主循环会尽量让
         预处理、推理和后处理三个阶段形成轻量级流水线。
+
+        运行时大致是一个“当前帧在推理、下一帧先预处理、上一帧做显示”的节奏，
+        以尽量减少 GPU 和 CPU 的空闲等待。
         """
         print("Realtime pipeline is running. Press Q to exit.")
 
@@ -309,9 +392,10 @@ class HighwayFogSystem:
             print("Failed to read from the video source.")
             return
 
-        tensor_n = self._preprocess_async(frame_n, self.preprocess_stream)
+        tensor_n, preprocess_meta_n = self._preprocess_async(frame_n, self.preprocess_stream)
         prev_outputs: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
         prev_frame: Optional[np.ndarray] = None
+        prev_preprocess_meta: Optional[dict[str, object]] = None
 
         while True:
             # 确保当前帧的推理要等待上一阶段的预处理完成。
@@ -323,7 +407,7 @@ class HighwayFogSystem:
             # 尽早读取下一帧并启动预处理，形成轻量级流水线。
             ret, frame_next = self.cap.read()
             if ret:
-                tensor_next = self._preprocess_async(frame_next, self.preprocess_stream)
+                tensor_next, preprocess_meta_next = self._preprocess_async(frame_next, self.preprocess_stream)
 
             if prev_outputs is not None and prev_frame is not None:
                 if self.inference_stream and self.postprocess_stream:
@@ -335,6 +419,7 @@ class HighwayFogSystem:
                     self.postprocess_stream.synchronize()
 
                 # 使用 EMA 平滑 beta，降低单帧预测抖动。
+                # 后续动态阈值直接基于这个平滑结果，而不是单帧瞬时值。
                 self.ema_beta = self.smooth_alpha * beta + (1 - self.smooth_alpha) * self.ema_beta
                 adaptive_conf = max(0.15, self.base_conf_thres - self.ema_beta * 1.2)
 
@@ -353,7 +438,13 @@ class HighwayFogSystem:
                 )
                 cv2.putText(draw_frame, info_line, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-                draw_frame, det_count = self._draw_detections(draw_frame, detections, adaptive_conf, fog_idx)
+                draw_frame, det_count = self._draw_detections(
+                    draw_frame,
+                    detections,
+                    adaptive_conf,
+                    fog_idx,
+                    prev_preprocess_meta,
+                )
                 det_line = f"Visible Detections: {det_count}"
                 cv2.putText(draw_frame, det_line, (720, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
 
@@ -375,12 +466,14 @@ class HighwayFogSystem:
 
             prev_frame = frame_n.copy() if frame_n is not None else None
             prev_outputs = curr_outputs
+            prev_preprocess_meta = preprocess_meta_n
 
             if not ret:
                 break
 
             frame_n = frame_next
             tensor_n = tensor_next
+            preprocess_meta_n = preprocess_meta_next
 
         self.cap.release()
         cv2.destroyAllWindows()
@@ -398,6 +491,7 @@ def main():
     system = HighwayFogSystem(model_path, video_source=video_source, cfg=cfg)
 
     # Windows 通常没有 DISPLAY 环境变量，因此只在类 Unix 环境下据此判断是否无头运行。
+    # 无头环境下不弹 UI，而是跑一次最小烟雾推理，确认链路可执行。
     if os.name != "nt" and "DISPLAY" not in os.environ:
         print("Headless environment detected. Running a smoke inference.")
         dummy_frame = np.zeros((540, 960, 3), dtype=np.uint8)

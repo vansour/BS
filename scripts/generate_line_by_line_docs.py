@@ -2,13 +2,17 @@
 """
 生成项目 Python 源码逐行说明文档。
 
-此脚本会输出两类文档：
-1. 根目录总文档：PYTHON_LINE_BY_LINE_EXPLANATION.md
-2. 拆分文档目录：docs/python-line-by-line/
+本脚本用于自动生成“项目 Python 源码逐行说明文档”，产出包括：
+1. 根目录总文档：`PYTHON_LINE_BY_LINE_EXPLANATION.md`；
+2. 拆分文档目录：`docs/python-line-by-line/`。
 
-注意：
-- 仅覆盖项目自写 Python 文件。
-- 不覆盖 python/ 目录中的解释器、标准库与第三方包。
+该脚本的核心目标不是生成面向机器的 API 文档，而是生成面向人工阅读的
+教学型说明文档，使项目源码能够以“文件职责 + 关键定义 + 逐行解释”的形式
+被系统化整理，便于课程答辩、项目交接与代码讲解。
+
+注意事项如下：
+- 仅覆盖项目自写 Python 文件；
+- 不覆盖 `python/` 目录中的解释器、标准库与第三方包。
 """
 
 from __future__ import annotations
@@ -23,16 +27,18 @@ ROOT = Path(__file__).resolve().parents[1]
 COMBINED_PATH = ROOT / "PYTHON_LINE_BY_LINE_EXPLANATION.md"
 SPLIT_ROOT = ROOT / "docs" / "python-line-by-line"
 
+# TARGET_FILES 定义需要纳入文档生成的源码范围。
+# 当前策略是：
+# - 显式纳入根目录下的重要脚本；
+# - 递归纳入 `src/` 目录中全部 Python 源文件。
 TARGET_FILES = [
     ROOT / "config.py",
-    ROOT / "generate_midterm_defense_ppt.py",
     *sorted((ROOT / "src").rglob("*.py")),
 ]
 
 
 MODULE_DESCRIPTIONS = {
     "config.py": "顶层兼容模块。它本身不承载业务逻辑，而是为了兼容旧版 checkpoint 中的模块路径 `config.Config`，把真正的配置类从 `src.config` 重新导出。",
-    "generate_midterm_defense_ppt.py": "中期答辩 PPT 自动生成脚本。它使用 `python-pptx` 按页面模块化方式构建整套答辩幻灯片，并将产物写入 `outputs/Midterm_Defense_Presentation.pptx`。",
     "src/__init__.py": "项目顶层包初始化文件。它统一暴露最常用的配置、数据、模型、推理与工具接口，方便外部直接从 `src` 导入。",
     "src/config.py": "项目的全局配置中心，集中保存路径、超参数、物理参数、设备配置和输出目录，是训练、推理、导出三条主链共用的配置源。",
     "src/data/__init__.py": "数据子包初始化文件，负责把数据集、深度估计器和数据准备器统一导出。",
@@ -200,6 +206,13 @@ def escape_md(text: str) -> str:
 
 
 class BlockCollector(ast.NodeVisitor):
+    """
+    基于 AST 的代码块收集器。
+
+    该类用于在源码抽象语法树中提取类、函数及其文档字符串范围，
+    为后续“逐行解释”阶段提供结构化上下文信息。
+    """
+
     def __init__(self) -> None:
         self.stack: list[str] = []
         self.blocks: list[dict[str, object]] = []
@@ -243,6 +256,15 @@ class BlockCollector(ast.NodeVisitor):
 
 
 def collect_metadata(path: Path):
+    """
+    读取单个源码文件并提取结构化元数据。
+
+    Args:
+        path: 目标源码文件路径。
+
+    Returns:
+        tuple: 源码行列表、代码块信息和文档字符串范围。
+    """
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     collector = BlockCollector()
@@ -461,6 +483,12 @@ def explain_line(path_key: str, line_no: int, line: str, blocks, doc_ranges):
 
 
 def generate_combined_document(metadata):
+    """
+    生成总版逐行说明文档。
+
+    Args:
+        metadata: 所有目标文件的结构化元数据集合。
+    """
     with COMBINED_PATH.open("w", encoding="utf-8-sig", newline="\n") as handle:
         handle.write("# 项目 Python 源码逐行详解文档\n\n")
         handle.write("## 说明\n\n")
@@ -499,6 +527,11 @@ def generate_combined_document(metadata):
 
 
 def split_combined_document():
+    """
+    将总版逐行说明文档拆分为按源码路径组织的独立 Markdown 文件。
+
+    拆分后的目录结构与源码目录保持一致，便于按文件逐个查阅。
+    """
     SPLIT_ROOT.mkdir(parents=True, exist_ok=True)
 
     lines = COMBINED_PATH.read_text(encoding="utf-8-sig").splitlines()
@@ -546,6 +579,15 @@ def split_combined_document():
 
 
 def main():
+    """
+    脚本主入口。
+
+    主流程包括：
+    1. 收集所有目标源码文件的结构化信息；
+    2. 生成总版逐行说明文档；
+    3. 生成拆分后的独立说明文档目录；
+    4. 输出覆盖文件数与行数统计。
+    """
     metadata = []
     for path in TARGET_FILES:
         lines, blocks, doc_ranges = collect_metadata(path)

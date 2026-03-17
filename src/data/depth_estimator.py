@@ -8,6 +8,10 @@ Depth Estimator
 2. 计算单张图像的深度图；
 3. 批量处理图像；
 4. 为训练数据集预计算并缓存深度图。
+
+在本项目中，深度并非最终研究目标，而是在线造雾模块所依赖的中间条件变量。
+因此本模块的目标并非恢复绝对精确的度量深度，而是获得能够稳定反映场景相对远近
+关系的深度先验，以支撑后续基于大气散射模型的雾化合成。
 """
 
 import os
@@ -25,6 +29,9 @@ class DepthEstimator:
 
     该类把深度估计逻辑集中起来，便于在训练准备阶段批量生成深度缓存，
     从而避免训练期间重复执行较重的深度推理。
+
+    当前实现依赖 `torch.hub` 加载 MiDaS 模型。该方案能够降低接入门槛，
+    但也意味着首次运行可能需要联网下载或依赖本地缓存。
     """
 
     def __init__(self, model_name="MiDaS_small", device=None):
@@ -34,6 +41,11 @@ class DepthEstimator:
         Args:
             model_name: MiDaS 模型名称，例如 `MiDaS_small`。
             device: 指定推理设备；若为空则自动选择 CUDA 或 CPU。
+
+        `MiDaS_small` 被默认选中，主要原因包括：
+        - 更适合本项目这种需要批量预计算的场景；
+        - 推理速度和显存压力相对更友好；
+        - 深度图只作为雾化条件，不要求极致精度。
         """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,6 +70,16 @@ class DepthEstimator:
         Returns:
             np.ndarray: 归一化后的深度图，形状为 `(H, W)`，
             其中 `0` 表示近处，`1` 表示远处。
+
+        当前输出并非 MiDaS 的原始预测值，而是经过以下处理后得到的项目内部深度定义：
+        1. 插值回原图大小；
+        2. 归一化到 `[0, 1]`；
+        3. 方向翻转；
+
+        最后的 `1.0 - depth` 很关键，因为项目后续约定是：
+        - 0 表示近；
+        - 1 表示远；
+        这样更符合在线造雾时“远处受雾影响更明显”的直觉。
         """
         h, w = image_rgb.shape[:2]
 
@@ -74,6 +96,7 @@ class DepthEstimator:
             ).squeeze()
 
         # 将深度结果缩放到 [0, 1] 区间，并反转方向以符合本项目的远近约定。
+        # 这里不保留原始物理量纲，因为后续造雾只需要相对深浅关系。
         depth = prediction.cpu().numpy()
         d_min, d_max = depth.min(), depth.max()
         depth = (depth - d_min) / (d_max - d_min + 1e-6)
@@ -91,6 +114,9 @@ class DepthEstimator:
 
         Returns:
             list[np.ndarray]: 深度图列表。
+
+        该接口名称虽然包含 batch，但当前实现内部仍然逐张调用 `compute_depth()`。
+        保留 `batch_size` 参数的目的，是为后续如需切换为真正批量推理时预留接口兼容性。
         """
         depths = []
 
@@ -115,6 +141,9 @@ def precompute_depths(dataset, device, batch_size=4):
         dataset: `MultiTaskDataset` 实例。
         device: 当前计算设备。
         batch_size: 预留的批处理参数，便于后续扩展批量计算逻辑。
+
+    本函数的职责是补齐缺失缓存，而不是重新覆盖全部缓存。
+    因此在遍历过程中，已存在的 `.npy` 文件会被直接跳过。
     """
     print(f"开始深度图预计算，总样本数: {len(dataset)}")
 
@@ -133,6 +162,7 @@ def precompute_depths(dataset, device, batch_size=4):
             image_pil = Image.open(img_path).convert("RGB")
             img_rgb = np.array(image_pil)
             depth = estimator.compute_depth(img_rgb)
+            # 保存为 `.npy`，便于后续在 Dataset 中零损耗读取。
             np.save(depth_path, depth)
         except Exception as e:
             print(f"预计算图像 {img_path} 失败: {e}")
