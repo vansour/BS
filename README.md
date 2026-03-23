@@ -1,6 +1,6 @@
 # 高速公路团雾监测项目 README
 
-更新日期：2026-03-17
+更新日期：2026-03-19
 
 ## 项目概述
 
@@ -38,7 +38,7 @@
 - `outputs/Depth_Cache/` 已存在 `66,241` 个 `.npy` 深度缓存文件
 - `outputs/Fog_Detection_Project/` 当前为空，训练权重和 checkpoint 不随 Git 提交
 - `outputs/`、`.pt`、`.onnx` 等产物被 `.gitignore` 忽略，因此 README 不再假定仓库中一定附带权重和导出文件
-- 根目录 `requirements.txt` 当前不存在；仓库更依赖自带的 `python/` 运行环境和本地依赖状态
+- 根目录现已提供 `requirements.txt` 和 `requirements-dev.txt`，用于补齐核心运行依赖与开发工具依赖
 
 这意味着：代码主线已经打通，但模型效果、权重文件和导出产物是否存在，取决于当前工作区是否实际执行过训练或导出。
 
@@ -256,7 +256,8 @@ D:\BS
 补充说明：
 
 - `pyproject.toml` 当前只提供 `black`、`mypy`、`ruff` 相关配置，不是完整依赖锁定文件
-- `requirements.txt` 当前不在仓库中
+- `requirements.txt` 现提供核心运行依赖，`requirements-dev.txt` 现提供开发工具依赖
+- `tensorrt` 仍因平台差异未纳入默认 pip 清单
 - `MiDaS` 通过 `torch.hub` 加载，首次运行可能依赖联网或本地缓存
 
 ## 常用命令
@@ -338,7 +339,7 @@ $env:BS_PRECOMPUTE_DEPTH_CACHE='1'
 - 当前工作区未附带训练好的正式权重文件
 - `outputs/Fog_Detection_Project/` 当前为空，因此首次推理大概率会退回随机初始化权重
 - 由于 `outputs/` 被忽略，README 不能把“某个权重/某个 ONNX 已存在”写成固定事实
-- 项目缺少完整、可锁定版本的一键依赖清单
+- 当前仅补齐了 pip 依赖清单，尚未提供包含系统库、CUDA 和 conda 元数据的完整锁定环境文件
 - 最终论文所需的系统性量化实验结果仍需要单独整理
 
 ## 代码入口索引

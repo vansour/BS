@@ -1,0 +1,13 @@
+# Core runtime dependencies for the BS project.
+# TensorRT is intentionally excluded here because it is platform-specific
+# and only required for the optional deployment/export path.
+
+numpy>=2.0
+Pillow>=10.0
+tqdm>=4.66
+opencv-python>=4.10
+torch
+torchvision
+ultralytics>=8.4
+onnx>=1.18
+timm>=1.0

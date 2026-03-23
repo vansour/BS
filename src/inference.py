@@ -76,6 +76,7 @@ class HighwayFogSystem:
         self.cfg = cfg or Config()
         self.device = self.cfg.DEVICE
         self.model_path = self._resolve_model_path(model_path)
+        self.video_source = video_source
 
         # 初始化模型并加载权重。
         self.model = UnifiedMultiTaskModel(
@@ -106,11 +107,29 @@ class HighwayFogSystem:
             self.inference_stream = None
             self.postprocess_stream = None
 
-        self.cap = cv2.VideoCapture(video_source)
+        # 单帧 `predict()` 并不依赖视频流。把 VideoCapture 延迟到 `run()` 中创建，
+        # 可以避免纯图像推理或无头烟雾测试时触发不必要的摄像头访问告警。
+        self.cap = None
         self.ema_beta = 0.0
         self.smooth_alpha = self.cfg.EMA_ALPHA
         self.base_conf_thres = self.cfg.BASE_CONF_THRES
         self.det_class_names = getattr(self.cfg, "DET_CLASS_NAMES", ["vehicle"])
+
+    def _ensure_video_capture(self) -> bool:
+        """
+        按需打开视频源。
+
+        Returns:
+            bool: 成功打开返回 True，否则返回 False。
+        """
+        if self.cap is not None and self.cap.isOpened():
+            return True
+
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
+            print(f"Failed to open video source: {self.video_source}")
+            return False
+        return True
 
     def _resolve_model_path(self, requested_path: Optional[str]) -> Optional[str]:
         """
@@ -313,9 +332,93 @@ class HighwayFogSystem:
         这是最适合被外部脚本直接调用的同步接口。
         如果不需要完整视频循环和 UI，只需要单帧结果，就走这里。
         """
-        img_tensor, _ = self._preprocess_async(frame)
+        img_tensor, preprocess_meta = self._preprocess_async(frame)
         outputs = self._inference_async(img_tensor)
-        return self._postprocess_async(outputs)
+        probs, beta, detections = self._postprocess_async(outputs)
+        detections = self._restore_detections_to_original_frame(detections, preprocess_meta)
+        return probs, beta, detections
+
+    def _restore_detections_to_original_frame(
+        self,
+        detections: torch.Tensor,
+        preprocess_meta: Optional[dict[str, object]],
+    ) -> torch.Tensor:
+        """
+        把检测框从 letterbox 输入坐标系还原到原始帧坐标系。
+
+        该还原只用于 `predict()` 这种“直接把结果返回给外部调用方”的场景。
+        `run()` 内部的显示路径仍然保留原来的 letterbox 坐标，并在绘制前再做一次
+        针对显示分辨率的映射。
+        """
+        if detections.numel() == 0 or preprocess_meta is None:
+            return detections
+
+        restored = detections.clone()
+        restored[:, :4] = invert_letterbox_boxes_xyxy(restored[:, :4], preprocess_meta)
+        return restored
+
+    def _render_output_frame(
+        self,
+        frame: np.ndarray,
+        outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        preprocess_meta: Optional[dict[str, object]],
+    ) -> np.ndarray:
+        """
+        将单帧模型输出转换成最终展示帧。
+
+        这里统一完成：
+        1. 模型输出后处理；
+        2. beta EMA 平滑；
+        3. 动态阈值计算；
+        4. 状态栏与检测框绘制。
+        """
+        if self.inference_stream and self.postprocess_stream:
+            self.postprocess_stream.wait_stream(self.inference_stream)
+
+        probs, beta, detections = self._postprocess_async(outputs, self.postprocess_stream)
+
+        if self.postprocess_stream:
+            self.postprocess_stream.synchronize()
+
+        self.ema_beta = self.smooth_alpha * beta + (1 - self.smooth_alpha) * self.ema_beta
+        adaptive_conf = max(0.15, self.base_conf_thres - self.ema_beta * 1.2)
+
+        draw_frame = cv2.resize(frame, (960, 540))
+        fog_idx = int(np.argmax(probs))
+        status = self.FOG_CLASS_NAMES[fog_idx]
+        color = self.FOG_COLORS[fog_idx]
+
+        cv2.rectangle(draw_frame, (0, 0), (960, 80), (45, 45, 45), -1)
+        cv2.putText(draw_frame, f"STATUS: {status}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+        info_line = (
+            f"Beta: {self.ema_beta:.4f} | Base Conf: {self.base_conf_thres:.2f} "
+            f"-> Adaptive Conf: {adaptive_conf:.2f}"
+        )
+        cv2.putText(draw_frame, info_line, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        draw_frame, det_count = self._draw_detections(
+            draw_frame,
+            detections,
+            adaptive_conf,
+            fog_idx,
+            preprocess_meta,
+        )
+        det_line = f"Visible Detections: {det_count}"
+        cv2.putText(draw_frame, det_line, (720, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+
+        if fog_idx > 0:
+            cv2.putText(
+                draw_frame,
+                "LOW CONF OBJECTS RECOVERED",
+                (300, 300),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
+
+        return draw_frame
 
     def _draw_detections(
         self,
@@ -387,15 +490,23 @@ class HighwayFogSystem:
         """
         print("Realtime pipeline is running. Press Q to exit.")
 
+        if not self._ensure_video_capture():
+            return
+
         ret, frame_n = self.cap.read()
         if not ret:
             print("Failed to read from the video source.")
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
             return
 
         tensor_n, preprocess_meta_n = self._preprocess_async(frame_n, self.preprocess_stream)
         prev_outputs: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
         prev_frame: Optional[np.ndarray] = None
         prev_preprocess_meta: Optional[dict[str, object]] = None
+        requested_exit = False
+        stream_ended = False
 
         while True:
             # 确保当前帧的推理要等待上一阶段的预处理完成。
@@ -410,58 +521,10 @@ class HighwayFogSystem:
                 tensor_next, preprocess_meta_next = self._preprocess_async(frame_next, self.preprocess_stream)
 
             if prev_outputs is not None and prev_frame is not None:
-                if self.inference_stream and self.postprocess_stream:
-                    self.postprocess_stream.wait_stream(self.inference_stream)
-
-                probs, beta, detections = self._postprocess_async(prev_outputs, self.postprocess_stream)
-
-                if self.postprocess_stream:
-                    self.postprocess_stream.synchronize()
-
-                # 使用 EMA 平滑 beta，降低单帧预测抖动。
-                # 后续动态阈值直接基于这个平滑结果，而不是单帧瞬时值。
-                self.ema_beta = self.smooth_alpha * beta + (1 - self.smooth_alpha) * self.ema_beta
-                adaptive_conf = max(0.15, self.base_conf_thres - self.ema_beta * 1.2)
-
-                draw_frame = cv2.resize(prev_frame, (960, 540))
-                fog_idx = int(np.argmax(probs))
-                status = self.FOG_CLASS_NAMES[fog_idx]
-                color = self.FOG_COLORS[fog_idx]
-
-                # 叠加状态栏与 beta 信息。
-                cv2.rectangle(draw_frame, (0, 0), (960, 80), (45, 45, 45), -1)
-                cv2.putText(draw_frame, f"STATUS: {status}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-                info_line = (
-                    f"Beta: {self.ema_beta:.4f} | Base Conf: {self.base_conf_thres:.2f} "
-                    f"-> Adaptive Conf: {adaptive_conf:.2f}"
-                )
-                cv2.putText(draw_frame, info_line, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-                draw_frame, det_count = self._draw_detections(
-                    draw_frame,
-                    detections,
-                    adaptive_conf,
-                    fog_idx,
-                    prev_preprocess_meta,
-                )
-                det_line = f"Visible Detections: {det_count}"
-                cv2.putText(draw_frame, det_line, (720, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
-
-                # 雾天条件下给出提示性文案，表示系统倾向于放宽低置信度目标的保留。
-                if fog_idx > 0:
-                    cv2.putText(
-                        draw_frame,
-                        "LOW CONF OBJECTS RECOVERED",
-                        (300, 300),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 255),
-                        2,
-                    )
-
+                draw_frame = self._render_output_frame(prev_frame, prev_outputs, prev_preprocess_meta)
                 cv2.imshow("Adaptive Fog System (Pipelined)", draw_frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
+                    requested_exit = True
                     break
 
             prev_frame = frame_n.copy() if frame_n is not None else None
@@ -469,13 +532,22 @@ class HighwayFogSystem:
             prev_preprocess_meta = preprocess_meta_n
 
             if not ret:
+                stream_ended = True
                 break
 
             frame_n = frame_next
             tensor_n = tensor_next
             preprocess_meta_n = preprocess_meta_next
 
-        self.cap.release()
+        # 流结束时，循环里还残留一帧“已推理但未显示”的结果，这里补刷一次。
+        if stream_ended and not requested_exit and prev_outputs is not None and prev_frame is not None:
+            draw_frame = self._render_output_frame(prev_frame, prev_outputs, prev_preprocess_meta)
+            cv2.imshow("Adaptive Fog System (Pipelined)", draw_frame)
+            cv2.waitKey(1)
+
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
         cv2.destroyAllWindows()
 
 
@@ -503,5 +575,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

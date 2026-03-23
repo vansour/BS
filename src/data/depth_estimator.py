@@ -23,6 +23,33 @@ from PIL import Image
 from tqdm import tqdm
 
 
+def _ensure_torch_hub_trusted(repo_owner_name: str) -> None:
+    """
+    确保指定仓库已写入 torch.hub 的信任名单。
+
+    MiDaS_small 在加载过程中会递归依赖
+    `rwightman/gen-efficientnet-pytorch`。在无交互脚本环境里，
+    如果该仓库尚未出现在 `trusted_list` 中，`torch.hub` 会阻塞在
+    `input()` 提示上并直接抛出 `EOFError`。这里在真正调用
+    `torch.hub.load()` 之前主动补齐信任名单，避免训练前深度预计算被交互式提示卡死。
+    """
+    hub_dir = Path(torch.hub.get_dir())
+    trusted_list = hub_dir / "trusted_list"
+    trusted_list.parent.mkdir(parents=True, exist_ok=True)
+    trusted_list.touch(exist_ok=True)
+
+    existing = {
+        line.strip()
+        for line in trusted_list.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    if repo_owner_name in existing:
+        return
+
+    with trusted_list.open("a", encoding="utf-8") as handle:
+        handle.write(repo_owner_name + "\n")
+
+
 class DepthEstimator:
     """
     基于 MiDaS 的深度估计器。
@@ -52,9 +79,17 @@ class DepthEstimator:
         print(f"正在初始化 MiDaS 深度估计引擎，设备: {self.device}")
 
         try:
+            # MiDaS_small 会级联加载 EfficientNet Lite 骨干；在脚本环境中提前写入
+            # trusted_list，可避免 torch.hub 触发无法回答的交互式确认提示。
+            _ensure_torch_hub_trusted("intel-isl_MiDaS")
+            _ensure_torch_hub_trusted("rwightman_gen-efficientnet-pytorch")
             self.model = torch.hub.load("intel-isl/MiDaS", model_name, trust_repo=True)
             self.model.to(self.device).eval()
-            self.transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+            self.transform = torch.hub.load(
+                "intel-isl/MiDaS",
+                "transforms",
+                trust_repo=True,
+            ).small_transform
             print(f"MiDaS 模型加载成功: {model_name}")
         except Exception as e:
             print(f"MiDaS 模型加载失败: {e}")
@@ -176,5 +211,4 @@ if __name__ == "__main__":
     test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
     depth = estimator.compute_depth(test_img)
     print(f"Depth shape: {depth.shape}, range: [{depth.min():.4f}, {depth.max():.4f}]")
-
 

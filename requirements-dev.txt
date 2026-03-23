@@ -1,0 +1,5 @@
+-r requirements.txt
+
+black>=26.0
+ruff>=0.15
+mypy>=1.19
