@@ -1,6 +1,6 @@
 # 高速公路团雾监测项目 README
 
-更新日期：2026-03-19
+更新日期：2026-04-07
 
 ## 项目概述
 
@@ -35,10 +35,11 @@
 
 当前工作区的真实状态也需要明确说明：
 
-- `outputs/Depth_Cache/` 已存在 `66,241` 个 `.npy` 深度缓存文件
-- `outputs/Fog_Detection_Project/` 当前为空，训练权重和 checkpoint 不随 Git 提交
-- `outputs/`、`.pt`、`.onnx` 等产物被 `.gitignore` 忽略，因此 README 不再假定仓库中一定附带权重和导出文件
+- UA-DETRAC 数据当前已经整理到 `data/UA-DETRAC/...` 目录结构下，与 [src/config.py](./src/config.py) 的默认路径约定一致
+- `outputs/Depth_Cache/`、`outputs/Fog_Detection_Project/` 和 `checkpoints/` 会在首次运行配置或训练脚本时自动创建，但不随 Git 提交
+- 当前工作区未附带现成训练权重、checkpoint、ONNX 或 INT8 引擎文件
 - 根目录现已提供 `requirements.txt` 和 `requirements-dev.txt`，用于补齐核心运行依赖与开发工具依赖
+- 根目录现已提供 [scripts/smoke_test.py](./scripts/smoke_test.py)，用于做阶段一的训练前自检
 
 这意味着：代码主线已经打通，但模型效果、权重文件和导出产物是否存在，取决于当前工作区是否实际执行过训练或导出。
 
@@ -234,12 +235,12 @@ D:\BS
 
 ## 环境与依赖
 
-当前仓库体现出的真实环境特征：
+当前仓库在工程层面的约定已经收口为：
 
-- 平台：Windows
-- 工作目录：`D:\BS`
-- 本地解释器：`D:\BS\python\python.exe`
-- 默认设备：自动检测 CUDA，不可用时回退 CPU
+- 命令默认在仓库根目录执行
+- Python 解释器默认使用当前已激活环境中的 `python`
+- 数据、缓存、输出和 checkpoint 默认按仓库相对路径解析
+- 默认设备自动检测 CUDA；也可以通过环境变量强制切到 CPU 或指定其它路径
 
 关键依赖来自代码实际使用：
 
@@ -259,36 +260,94 @@ D:\BS
 - `requirements.txt` 现提供核心运行依赖，`requirements-dev.txt` 现提供开发工具依赖
 - `tensorrt` 仍因平台差异未纳入默认 pip 清单
 - `MiDaS` 通过 `torch.hub` 加载，首次运行可能依赖联网或本地缓存
+- `src/__init__.py`、`src.data` 和 `src.model` 现在采用懒加载导出，避免仅导入配置模块时就被 `ultralytics` 等重依赖阻断
 
 ## 常用命令
 
-以下命令均假定你在仓库根目录 `D:\BS` 下执行。
+以下命令均假定你已进入仓库根目录，并且 `python` 指向当前项目要使用的环境。
 
-### 1. 预计算深度缓存
+### 1. 安装运行依赖
 
-```powershell
-.\python\python.exe scripts\precompute_depth_cache.py
+```bash
+python -m pip install -r requirements.txt
 ```
 
-### 2. 训练
+如果你还需要格式化、类型检查等开发工具：
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
+### 2. 训练前 smoke test
+
+先做基础环境、路径和数据索引检查：
+
+```bash
+python scripts/smoke_test.py
+```
+
+如果还想额外验证模型可以成功初始化并完成一次随机张量前向：
+
+```bash
+python scripts/smoke_test.py --check-forward
+```
+
+### 3. 数据审计与样例可视化
+
+阶段二的数据链路校验脚本会输出：
+
+- `outputs/Data_Audit/dataset_audit_report.json`
+- `outputs/Data_Audit/dataset_audit_report.md`
+- `outputs/Data_Audit/visualizations/` 下的样例图
+
+```bash
+python scripts/check_dataset.py
+```
+
+### 4. 预计算深度缓存
+
+```bash
+python scripts/precompute_depth_cache.py
+```
+
+### 5. 训练
 
 训练入口现在会先检查训练集和验证集的深度缓存覆盖情况；只要任一侧存在缺失文件，就会自动补算缺失部分。显式设置 `BS_PRECOMPUTE_DEPTH_CACHE=1` 时，则会强制进入预计算流程。
 
-```powershell
-.\python\python.exe src\train.py
+```bash
+python src/train.py
 ```
 
 如果希望训练前自动补算深度缓存：
 
-```powershell
-$env:BS_PRECOMPUTE_DEPTH_CACHE='1'
-.\python\python.exe src\train.py
+```bash
+BS_PRECOMPUTE_DEPTH_CACHE=1 python src/train.py
 ```
 
-### 3. 推理
+如果只想做小规模训练闭环验证，而不是直接启动正式训练，可以用 smoke run：
 
-```powershell
-.\python\python.exe src\inference.py
+```bash
+BS_EPOCHS=1 \
+BS_QAT_EPOCHS=0 \
+BS_SKIP_QAT=1 \
+BS_BATCH_SIZE=2 \
+BS_IMG_SIZE=320 \
+BS_NUM_WORKERS=0 \
+BS_MAX_TRAIN_BATCHES=3 \
+BS_MAX_VAL_BATCHES=2 \
+python src/train.py
+```
+
+训练脚本现在会为每次运行自动创建独立运行目录：
+
+- `outputs/Fog_Detection_Project/runs/<run_name>/config_snapshot.json`
+- `outputs/Fog_Detection_Project/runs/<run_name>/metrics.jsonl`
+- `outputs/Fog_Detection_Project/runs/<run_name>/summary.json`
+
+### 6. 推理
+
+```bash
+python src/inference.py
 ```
 
 默认逻辑会优先尝试：
@@ -299,34 +358,84 @@ $env:BS_PRECOMPUTE_DEPTH_CACHE='1'
 
 如果这些文件不存在，推理脚本会退回到随机初始化权重，以便做链路联调。
 
-### 4. 导出 ONNX
+### 7. 导出 ONNX
 
-```powershell
-.\python\python.exe src\export.py
+```bash
+python src/export.py
 ```
 
 导出脚本会自动尝试解析最适合的权重文件；如果找不到，也允许在随机初始化权重下导出图结构。
 
-### 5. 生成逐行说明文档
+### 8. 生成逐行说明文档
 
-```powershell
-.\python\python.exe scripts\generate_line_by_line_docs.py
+```bash
+python scripts/generate_line_by_line_docs.py
 ```
 
 ## 训练相关环境变量
 
 `src/config.py` 和 `src/utils.py` 当前支持通过环境变量做轻量覆盖：
 
+- `BS_RAW_DATA_DIR`
+  覆盖训练图像目录，避免为了切换数据根目录而改源码
+- `BS_XML_DIR`
+  覆盖 XML 标注目录
+- `BS_DEPTH_CACHE_DIR`
+  覆盖深度缓存目录
+- `BS_OUTPUT_DIR`
+  覆盖统一输出目录
+- `BS_CHECKPOINT_DIR`
+  覆盖 checkpoint 目录
+- `BS_YOLO_BASE_MODEL`
+  覆盖基础 YOLO 权重名或本地权重路径
+- `BS_DEVICE`
+  覆盖默认设备选择，例如 `cpu` 或 `cuda`
 - `BS_FRAME_STRIDE`
   控制帧抽样步长，默认 `1`
+- `BS_BATCH_SIZE`
+  覆盖训练 batch size
+- `BS_EPOCHS`
+  覆盖 FP32 训练 epoch 数
+- `BS_QAT_EPOCHS`
+  覆盖 QAT 训练 epoch 数；设为 `0` 可直接跳过 QAT
+- `BS_LR`
+  覆盖 FP32 学习率
+- `BS_QAT_LR`
+  覆盖 QAT 学习率
+- `BS_IMG_SIZE`
+  覆盖训练与推理输入尺寸
 - `BS_PRECOMPUTE_DEPTH_CACHE`
   为 `1/true/yes/on` 时，训练入口会强制执行预计算流程；即使未设置，只要 train/val 存在缺失缓存，也会自动补算
+- `BS_SKIP_QAT`
+  为 `1/true/yes/on` 时跳过 QAT/INT8 阶段
+- `BS_DISABLE_AMP`
+  为 `1/true/yes/on` 时在 CUDA 上禁用 AMP，便于排查数值稳定性问题
+- `BS_MAX_TRAIN_BATCHES`
+  限制每个训练 epoch 实际处理的 batch 数，适合 smoke run
+- `BS_MAX_VAL_BATCHES`
+  限制每个验证 epoch 实际处理的 batch 数，适合 smoke run
+- `BS_GRAD_CLIP_NORM`
+  启用梯度裁剪并设置最大范数；默认 `0` 表示关闭
+- `BS_NONFINITE_GRAD_MIN_BATCHES`
+  非有限梯度统计至少达到多少个 batch 后，才开始执行 warn/fail 阈值判断
+- `BS_NONFINITE_GRAD_WARN_RATIO`
+  非有限梯度 batch 占比达到该阈值时输出告警
+- `BS_NONFINITE_GRAD_FAIL_RATIO`
+  非有限梯度 batch 占比达到该阈值时直接中止训练
+- `BS_NONFINITE_GRAD_FAIL_STREAK`
+  只有连续多少个 epoch 都超过 `BS_NONFINITE_GRAD_FAIL_RATIO` 时，才真正中止训练
+- `BS_SEED`
+  覆盖训练随机种子
 - `BS_NUM_WORKERS`
   覆盖 DataLoader `num_workers`
 - `BS_PREFETCH_FACTOR`
   覆盖 DataLoader `prefetch_factor`
 - `BS_PERSISTENT_WORKERS`
   控制 DataLoader `persistent_workers`
+- `BS_CHECKPOINT_SAVE_INTERVAL`
+  覆盖 checkpoint 保存间隔
+- `BS_CHECKPOINT_KEEP_MAX`
+  覆盖 checkpoint 历史保留数量
 - `BS_CUDNN_DETERMINISTIC`
   控制 CuDNN 是否走确定性模式
 - `BS_CUDNN_BENCHMARK`
@@ -337,7 +446,8 @@ $env:BS_PRECOMPUTE_DEPTH_CACHE='1'
 当前最需要实事求是说明的限制包括：
 
 - 当前工作区未附带训练好的正式权重文件
-- `outputs/Fog_Detection_Project/` 当前为空，因此首次推理大概率会退回随机初始化权重
+- 若 `yolo11n.pt` 不在本地，首次模型初始化可能触发 Ultralytics 自动下载基础权重
+- 若 `outputs/Fog_Detection_Project/` 下没有训练权重，推理脚本会退回随机初始化权重
 - 由于 `outputs/` 被忽略，README 不能把“某个权重/某个 ONNX 已存在”写成固定事实
 - 当前仅补齐了 pip 依赖清单，尚未提供包含系统库、CUDA 和 conda 元数据的完整锁定环境文件
 - 最终论文所需的系统性量化实验结果仍需要单独整理

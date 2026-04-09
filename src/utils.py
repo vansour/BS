@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 通用工具函数
 Common Utility Functions
@@ -51,7 +51,12 @@ def set_seed(seed: int = 42):
     if torch.cuda.is_available():
         # 允许通过环境变量在“确定性”和“性能优先”之间切换。
         # 这两个选项往往不能同时达到最优，需要根据实验目标取舍。
-        deterministic = os.getenv("BS_CUDNN_DETERMINISTIC", "0").lower() in {"1", "true", "yes", "on"}
+        deterministic = os.getenv("BS_CUDNN_DETERMINISTIC", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         benchmark = os.getenv(
             "BS_CUDNN_BENCHMARK",
             "0" if deterministic else "1",
@@ -146,6 +151,37 @@ def print_cuda_memory():
         )
 
 
+def split_sequence_names(
+    sequence_names: list[str],
+    train_ratio: float = 0.8,
+    seed: int = 42,
+) -> tuple[list[str], list[str]]:
+    """
+    按序列级执行可复现的 train/val 切分。
+
+    Args:
+        sequence_names: 待切分的序列名列表。
+        train_ratio: 训练集比例，取值范围为 `[0, 1]`。
+        seed: 随机种子，用于保证切分结果可复现。
+
+    Returns:
+        tuple[list[str], list[str]]: `(train_sequences, val_sequences)`。
+
+    这里先按名字排序，再基于独立随机源打乱，确保：
+    1. 同一输入集合在相同种子下结果稳定；
+    2. 不依赖外部全局 `random` 状态；
+    3. 训练主链和离线辅助链能共享完全一致的切分规则。
+    """
+    if not 0.0 <= float(train_ratio) <= 1.0:
+        raise ValueError(f"train_ratio must be within [0, 1], got {train_ratio!r}")
+
+    ordered_sequences = sorted(sequence_names)
+    shuffled_sequences = list(ordered_sequences)
+    random.Random(int(seed)).shuffle(shuffled_sequences)
+    split_idx = int(len(shuffled_sequences) * float(train_ratio))
+    return shuffled_sequences[:split_idx], shuffled_sequences[split_idx:]
+
+
 def _normalize_target_shape(target_size: int | tuple[int, int]) -> tuple[int, int]:
     """
     将目标尺寸统一解析为 `(height, width)`。
@@ -215,7 +251,9 @@ def letterbox_tensor(
             处理后的张量，以及用于框坐标反变换的元数据。
     """
     if tensor.ndim != 3:
-        raise ValueError(f"letterbox_tensor expects a CHW tensor, got shape={tuple(tensor.shape)}")
+        raise ValueError(
+            f"letterbox_tensor expects a CHW tensor, got shape={tuple(tensor.shape)}"
+        )
 
     metadata = compute_letterbox_metadata(tuple(tensor.shape[-2:]), target_size)
     resized_h, resized_w = metadata["resized_shape"]
@@ -311,7 +349,9 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     if not path.exists() or not path.is_dir():
         return None
 
-    checkpoint_files = [item for item in path.iterdir() if item.is_file() and item.suffix == ".pt"]
+    checkpoint_files = [
+        item for item in path.iterdir() if item.is_file() and item.suffix == ".pt"
+    ]
     if not checkpoint_files:
         return None
 
@@ -447,6 +487,3 @@ if __name__ == "__main__":
     # 简单自检：确认工具函数模块可以被独立执行。
     set_seed(42)
     print("Utils module test passed.")
-
-
-

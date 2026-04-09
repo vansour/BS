@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 多任务数据集
 Multi-Task Dataset
@@ -33,7 +33,11 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from src.utils import apply_letterbox_to_boxes_xyxy, letterbox_tensor
+from src.utils import (
+    apply_letterbox_to_boxes_xyxy,
+    letterbox_tensor,
+    split_sequence_names,
+)
 
 
 class MultiTaskDataset(Dataset):
@@ -66,6 +70,8 @@ class MultiTaskDataset(Dataset):
         det_train_class_id=0,
         img_size=None,
         keep_ratio=True,
+        train_ratio=0.8,
+        split_seed=42,
     ):
         """
         初始化数据集。
@@ -80,6 +86,8 @@ class MultiTaskDataset(Dataset):
             det_train_class_id: 检测训练标签在当前检测头类别空间中的类别编号。
             img_size: 训练输入尺寸；指定后会在数据集内部执行统一的空间变换。
             keep_ratio: 是否使用 letterbox 保持纵横比。
+            train_ratio: 训练集所占序列比例。
+            split_seed: 序列级切分的随机种子。
 
         初始化阶段主要完成三项工作：
         1. 扫描原始图像目录，建立样本索引；
@@ -94,6 +102,8 @@ class MultiTaskDataset(Dataset):
         self.det_train_class_id = int(det_train_class_id)
         self.img_size = img_size
         self.keep_ratio = bool(keep_ratio)
+        self.train_ratio = float(train_ratio)
+        self.split_seed = int(split_seed)
 
         if not os.path.exists(depth_cache_dir):
             os.makedirs(depth_cache_dir, exist_ok=True)
@@ -107,21 +117,31 @@ class MultiTaskDataset(Dataset):
 
         # 按视频序列划分训练/验证集，避免同一序列中的相邻帧同时出现在不同集合中。
         # 这是视频类数据处理中很重要的约束，否则验证集会和训练集高度相似，指标失真。
-        seq_folders = sorted([
-            d for d in os.listdir(raw_data_dir)
-            if os.path.isdir(os.path.join(raw_data_dir, d))
-        ])
+        seq_folders = sorted(
+            [
+                d
+                for d in os.listdir(raw_data_dir)
+                if os.path.isdir(os.path.join(raw_data_dir, d))
+            ]
+        )
 
-        split_idx = int(len(seq_folders) * 0.8)
-        selected_seqs = seq_folders[:split_idx] if is_train else seq_folders[split_idx:]
+        train_sequences, val_sequences = split_sequence_names(
+            seq_folders,
+            train_ratio=self.train_ratio,
+            seed=self.split_seed,
+        )
+        selected_seqs = train_sequences if is_train else val_sequences
 
         for seq in selected_seqs:
             seq_path = os.path.join(raw_data_dir, seq)
             # 对每个序列中的图像文件按文件名排序，再按 frame_stride 做稀疏采样。
-            files = sorted([
-                f for f in os.listdir(seq_path)
-                if f.lower().endswith((".jpg", ".png"))
-            ])[::self.frame_stride]
+            files = sorted(
+                [
+                    f
+                    for f in os.listdir(seq_path)
+                    if f.lower().endswith((".jpg", ".png"))
+                ]
+            )[:: self.frame_stride]
             for img_name in files:
                 self.samples.append((os.path.join(seq_path, img_name), seq, img_name))
 
@@ -185,12 +205,14 @@ class MultiTaskDataset(Dataset):
                     box = target.find("box")
                     if box is None:
                         continue
-                    boxes.append([
-                        float(box.get("left")),
-                        float(box.get("top")),
-                        float(box.get("width")),
-                        float(box.get("height")),
-                    ])
+                    boxes.append(
+                        [
+                            float(box.get("left")),
+                            float(box.get("top")),
+                            float(box.get("width")),
+                            float(box.get("height")),
+                        ]
+                    )
 
             sequence_data[frame_num] = boxes
 
@@ -235,7 +257,9 @@ class MultiTaskDataset(Dataset):
         )
 
     @staticmethod
-    def _xyxy_to_xywh_norm(boxes_xyxy: torch.Tensor, image_shape: tuple[int, int]) -> torch.Tensor:
+    def _xyxy_to_xywh_norm(
+        boxes_xyxy: torch.Tensor, image_shape: tuple[int, int]
+    ) -> torch.Tensor:
         """
         把绝对坐标 `xyxy` 框转换为归一化 `xywh`。
         """
@@ -279,10 +303,13 @@ class MultiTaskDataset(Dataset):
         img_path, seq, img_name = self.samples[idx]
 
         try:
-            image_pil = Image.open(img_path).convert("RGB")
+            with Image.open(img_path) as image:
+                image_pil = image.convert("RGB")
         except Exception as e:
-            print(f"无法读取图像 {img_path}: {e}")
-            image_pil = Image.new("RGB", (640, 640), (0, 0, 0))
+            raise RuntimeError(
+                f"无法读取训练图像: {img_path}: {e}。"
+                "已停止当前样本加载，避免使用黑图兜底导致图像、深度和检测标注失配。"
+            ) from e
 
         orig_w, orig_h = image_pil.size
 
@@ -307,7 +334,9 @@ class MultiTaskDataset(Dataset):
         # 检测标签仍然使用原图坐标，只是转换为相对比例，因此对后续 Resize 保持不变。
         frame_num = self._extract_frame_num(img_name)
         seq_annotations = self.annotations.get(seq, {})
-        frame_boxes = seq_annotations.get(frame_num, []) if frame_num is not None else []
+        frame_boxes = (
+            seq_annotations.get(frame_num, []) if frame_num is not None else []
+        )
 
         image_tensor = transforms.ToTensor()(image_pil)
         depth_tensor = torch.from_numpy(depth).unsqueeze(0).float()
@@ -315,8 +344,12 @@ class MultiTaskDataset(Dataset):
 
         if self.img_size is not None:
             if self.keep_ratio:
-                image_tensor, letterbox_meta = letterbox_tensor(image_tensor, self.img_size)
-                depth_tensor, _ = letterbox_tensor(depth_tensor, self.img_size, pad_value=0.0)
+                image_tensor, letterbox_meta = letterbox_tensor(
+                    image_tensor, self.img_size
+                )
+                depth_tensor, _ = letterbox_tensor(
+                    depth_tensor, self.img_size, pad_value=0.0
+                )
                 boxes_xyxy = apply_letterbox_to_boxes_xyxy(boxes_xyxy, letterbox_meta)
             else:
                 if isinstance(self.img_size, int):
@@ -373,4 +406,3 @@ class MultiTaskDataset(Dataset):
             det_cls_tensor = torch.zeros((0,), dtype=torch.float32)
 
         return image_tensor, depth_tensor, det_cls_tensor, det_box_tensor
-

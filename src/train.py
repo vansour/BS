@@ -1,4 +1,5 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
+# ruff: noqa: E402
 """
 统一多任务训练脚本
 Unified Multi-Task Training Script
@@ -19,9 +20,12 @@ Unified Multi-Task Training Script
 断点续训机制、QAT 量化训练以及最终 INT8 转换前的必要步骤。
 """
 
+import json
+import math
 import multiprocessing
 import os
 import sys
+from datetime import datetime, timezone
 
 import torch
 import torch.nn as nn
@@ -70,7 +74,18 @@ def build_cfg_snapshot(cfg: Config) -> dict:
         "qat_lr": cfg.QAT_LR,
         "img_size": cfg.IMG_SIZE,
         "frame_stride": cfg.FRAME_STRIDE,
+        "train_ratio": cfg.TRAIN_RATIO,
         "precompute_depth_cache": cfg.PRECOMPUTE_DEPTH_CACHE,
+        "skip_qat": cfg.SKIP_QAT,
+        "max_train_batches": cfg.MAX_TRAIN_BATCHES,
+        "max_val_batches": cfg.MAX_VAL_BATCHES,
+        "grad_clip_norm": cfg.GRAD_CLIP_NORM,
+        "nonfinite_grad_min_batches": cfg.NONFINITE_GRAD_MIN_BATCHES,
+        "nonfinite_grad_warn_ratio": cfg.NONFINITE_GRAD_WARN_RATIO,
+        "nonfinite_grad_fail_ratio": cfg.NONFINITE_GRAD_FAIL_RATIO,
+        "nonfinite_grad_fail_streak": cfg.NONFINITE_GRAD_FAIL_STREAK,
+        "nonfinite_grad_auto_disable_amp": cfg.NONFINITE_GRAD_AUTO_DISABLE_AMP,
+        "seed": cfg.SEED,
         "num_workers": cfg.NUM_WORKERS,
         "prefetch_factor": cfg.PREFETCH_FACTOR,
         "persistent_workers": cfg.PERSISTENT_WORKERS,
@@ -79,6 +94,194 @@ def build_cfg_snapshot(cfg: Config) -> dict:
         "a_min": cfg.A_MIN,
         "a_max": cfg.A_MAX,
     }
+
+
+def make_run_dir(cfg: Config) -> str:
+    """
+    为当前训练任务创建独立运行目录。
+
+    该目录用于保存：
+    - 配置快照；
+    - 逐 epoch 指标日志；
+    - 本次训练的最终摘要。
+    """
+    mode = (
+        "smoke"
+        if cfg.MAX_TRAIN_BATCHES > 0 or cfg.MAX_VAL_BATCHES > 0 or cfg.SKIP_QAT
+        else "train"
+    )
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(cfg.OUTPUT_DIR, "runs", f"{mode}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def write_json(path: str, payload: dict):
+    """以 UTF-8 JSON 格式写入结构化信息。"""
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def append_jsonl(path: str, payload: dict):
+    """向 JSONL 文件追加一条记录。"""
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def finite_scalar(name: str, value: torch.Tensor) -> float:
+    """
+    检查标量张量是否为有限值。
+
+    训练阶段一旦出现 NaN/Inf，就应立即终止并暴露问题，而不是继续污染后续状态。
+    """
+    scalar = float(value.detach().item())
+    if not math.isfinite(scalar):
+        raise RuntimeError(f"Non-finite {name} detected: {scalar}")
+    return scalar
+
+
+def init_epoch_meter() -> dict[str, float]:
+    """初始化单个 epoch 的指标累加器。"""
+    return {
+        "loss": 0.0,
+        "det": 0.0,
+        "fog_cls": 0.0,
+        "fog_reg": 0.0,
+        "grad_norm": 0.0,
+        "nonfinite_grad_batches": 0.0,
+        "batches": 0,
+    }
+
+
+def finalize_epoch_meter(meter: dict[str, float]) -> dict[str, float]:
+    """将累加器转换为平均指标。"""
+    batches = int(meter["batches"])
+    if batches <= 0:
+        raise RuntimeError("No batches were processed in the epoch.")
+
+    result = {
+        "loss": meter["loss"] / batches,
+        "det": meter["det"] / batches,
+        "fog_cls": meter["fog_cls"] / batches,
+        "fog_reg": meter["fog_reg"] / batches,
+        "batches": batches,
+    }
+    if meter["grad_norm"] > 0:
+        result["grad_norm"] = meter["grad_norm"] / batches
+    if meter["nonfinite_grad_batches"] > 0:
+        result["nonfinite_grad_batches"] = int(meter["nonfinite_grad_batches"])
+        result["nonfinite_grad_ratio"] = meter["nonfinite_grad_batches"] / batches
+    return result
+
+
+def clip_gradients(
+    model,
+    max_norm: float,
+    *,
+    allow_nonfinite: bool,
+) -> tuple[float, bool]:
+    """
+    执行梯度裁剪，并返回梯度范数与是否出现非有限值。
+
+    在 AMP 路径下，`GradScaler` 会负责处理非有限梯度并在必要时跳过更新，
+    因此这里只记录该状态而不立即中断训练；在纯 FP32 路径下则保持严格失败。
+    """
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm,
+        error_if_nonfinite=not allow_nonfinite,
+    )
+    grad_norm_value = float(grad_norm.detach().item())
+    if math.isfinite(grad_norm_value):
+        return grad_norm_value, False
+    if allow_nonfinite:
+        return 0.0, True
+    raise RuntimeError(f"Non-finite grad_norm detected: {grad_norm_value}")
+
+
+def evaluate_nonfinite_grad_health(
+    metrics: dict[str, float],
+    cfg: Config,
+    *,
+    phase: str,
+    epoch: int,
+    consecutive_fail_epochs: int,
+    amp_enabled: bool,
+) -> tuple[str | None, int, bool]:
+    """
+    评估当前 epoch 中非有限梯度的频率是否异常。
+
+    返回值为：
+    - 可打印的状态消息；
+    - 更新后的连续 fail 计数。
+    - 是否应触发“关闭 AMP 并继续训练”的恢复动作。
+
+    只有当“达到最小 batch 数”且“连续 N 个 epoch 超过 fail 阈值”时才中止训练。
+    """
+    nonfinite_batches = int(metrics.get("nonfinite_grad_batches", 0))
+    total_batches = int(metrics.get("batches", 0))
+    if nonfinite_batches <= 0 or total_batches <= 0:
+        return None, 0, False
+
+    ratio = float(
+        metrics.get("nonfinite_grad_ratio", nonfinite_batches / total_batches)
+    )
+    descriptor = (
+        f"{phase} epoch {epoch}: non-finite grad batches="
+        f"{nonfinite_batches}/{total_batches} ({ratio:.2%})"
+    )
+    if total_batches < cfg.NONFINITE_GRAD_MIN_BATCHES:
+        return (
+            (
+                f"Info: {descriptor}. "
+                f"Below BS_NONFINITE_GRAD_MIN_BATCHES={cfg.NONFINITE_GRAD_MIN_BATCHES}, "
+                "so warn/fail thresholds are not enforced."
+            ),
+            0,
+            False,
+        )
+
+    if cfg.NONFINITE_GRAD_FAIL_RATIO > 0 and ratio >= cfg.NONFINITE_GRAD_FAIL_RATIO:
+        next_streak = consecutive_fail_epochs + 1
+        should_disable_amp = (
+            amp_enabled
+            and cfg.NONFINITE_GRAD_AUTO_DISABLE_AMP
+            and next_streak >= cfg.NONFINITE_GRAD_FAIL_STREAK
+        )
+        if should_disable_amp:
+            return (
+                f"Warning: {descriptor}, which exceeds "
+                f"BS_NONFINITE_GRAD_FAIL_RATIO={cfg.NONFINITE_GRAD_FAIL_RATIO:.2%} "
+                f"for {next_streak} consecutive epoch(s). "
+                "AMP recovery will be triggered and subsequent epochs will run with AMP disabled.",
+                0,
+                True,
+            )
+        if next_streak >= cfg.NONFINITE_GRAD_FAIL_STREAK:
+            raise RuntimeError(
+                f"{descriptor}, which exceeds "
+                f"BS_NONFINITE_GRAD_FAIL_RATIO={cfg.NONFINITE_GRAD_FAIL_RATIO:.2%} "
+                f"for {next_streak} consecutive epoch(s)."
+            )
+        return (
+            f"Warning: {descriptor}, which exceeds "
+            f"BS_NONFINITE_GRAD_FAIL_RATIO={cfg.NONFINITE_GRAD_FAIL_RATIO:.2%}. "
+            f"Current fail streak: {next_streak}/{cfg.NONFINITE_GRAD_FAIL_STREAK}.",
+            next_streak,
+            False,
+        )
+
+    if cfg.NONFINITE_GRAD_WARN_RATIO > 0 and ratio >= cfg.NONFINITE_GRAD_WARN_RATIO:
+        return (
+            (
+                f"Warning: {descriptor}, which exceeds "
+                f"BS_NONFINITE_GRAD_WARN_RATIO={cfg.NONFINITE_GRAD_WARN_RATIO:.2%}."
+            ),
+            0,
+            False,
+        )
+
+    return None, 0, False
 
 
 def multitask_collate_fn(batch):
@@ -110,7 +313,9 @@ def multitask_collate_fn(batch):
             continue
         # 为当前图像中的每个目标都记录一个所属样本索引，
         # 供 Ultralytics loss 在 batch 内回溯目标归属。
-        batch_idx_all.append(torch.full((det_boxes.shape[0],), sample_idx, dtype=torch.int64))
+        batch_idx_all.append(
+            torch.full((det_boxes.shape[0],), sample_idx, dtype=torch.int64)
+        )
         cls_all.append(det_cls)
         bboxes_all.append(det_boxes)
 
@@ -217,7 +422,9 @@ def save_checkpoint(
     print(f"Saved checkpoint: {checkpoint_path}")
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None):
+def load_checkpoint(
+    checkpoint_path, model, optimizer=None, scheduler=None, scaler=None
+):
     """
     加载训练 checkpoint，并恢复训练状态。
 
@@ -310,12 +517,17 @@ def build_train_components(cfg: Config, device: str):
         std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
 
         def normalize(batch):
-            return (batch - mean.to(batch.device, batch.dtype)) / std.to(batch.device, batch.dtype)
+            return (batch - mean.to(batch.device, batch.dtype)) / std.to(
+                batch.device, batch.dtype
+            )
+
     else:
         # 保持接口一致：即便不做归一化，也返回一个可调用对象。
         normalize = nn.Identity()
     if not os.path.isdir(cfg.XML_DIR):
-        raise RuntimeError(f"Detection annotation directory was not found: {cfg.XML_DIR}")
+        raise RuntimeError(
+            f"Detection annotation directory was not found: {cfg.XML_DIR}"
+        )
 
     train_ds = MultiTaskDataset(
         cfg.RAW_DATA_DIR,
@@ -327,6 +539,8 @@ def build_train_components(cfg: Config, device: str):
         det_train_class_id=cfg.DET_TRAIN_CLASS_ID,
         img_size=cfg.IMG_SIZE,
         keep_ratio=True,
+        train_ratio=cfg.TRAIN_RATIO,
+        split_seed=cfg.SEED,
     )
     val_ds = MultiTaskDataset(
         cfg.RAW_DATA_DIR,
@@ -338,6 +552,8 @@ def build_train_components(cfg: Config, device: str):
         det_train_class_id=cfg.DET_TRAIN_CLASS_ID,
         img_size=cfg.IMG_SIZE,
         keep_ratio=True,
+        train_ratio=cfg.TRAIN_RATIO,
+        split_seed=cfg.SEED,
     )
     if len(train_ds) == 0:
         raise RuntimeError(f"Training dataset is empty: {cfg.RAW_DATA_DIR}")
@@ -345,7 +561,9 @@ def build_train_components(cfg: Config, device: str):
     print(f"Training samples: {len(train_ds)} (frame_stride={cfg.FRAME_STRIDE})")
     print(f"Validation samples: {len(val_ds)} (frame_stride={cfg.FRAME_STRIDE})")
 
-    train_missing_count, train_missing_examples = summarize_missing_depth_cache(train_ds)
+    train_missing_count, train_missing_examples = summarize_missing_depth_cache(
+        train_ds
+    )
     val_missing_count, val_missing_examples = (
         summarize_missing_depth_cache(val_ds) if len(val_ds) > 0 else (0, [])
     )
@@ -368,14 +586,18 @@ def build_train_components(cfg: Config, device: str):
         if cfg.PRECOMPUTE_DEPTH_CACHE:
             print("Depth cache precomputation is forced by BS_PRECOMPUTE_DEPTH_CACHE.")
         else:
-            print("Missing depth cache files were detected. Auto-precomputing train/val depth cache.")
+            print(
+                "Missing depth cache files were detected. Auto-precomputing train/val depth cache."
+            )
 
         if train_missing_count > 0 or cfg.PRECOMPUTE_DEPTH_CACHE:
             precompute_depths(train_ds, device)
         if len(val_ds) > 0 and (val_missing_count > 0 or cfg.PRECOMPUTE_DEPTH_CACHE):
             precompute_depths(val_ds, device)
     else:
-        print("Depth cache is already complete for both training and validation datasets.")
+        print(
+            "Depth cache is already complete for both training and validation datasets."
+        )
 
     # DataLoader 的几个关键选项：
     # - shuffle=True：训练阶段打乱样本顺序；
@@ -489,10 +711,14 @@ def train_epoch(
     5. 按权重求和后反向传播。
     """
     model.train()
-    total_loss = 0.0
+    meter = init_epoch_meter()
     pbar = tqdm(train_loader, desc=desc)
+    warned_nonfinite_amp_grad = False
 
-    for imgs, depths, det_targets in pbar:
+    for batch_index, (imgs, depths, det_targets) in enumerate(pbar, start=1):
+        if cfg.MAX_TRAIN_BATCHES > 0 and batch_index > cfg.MAX_TRAIN_BATCHES:
+            break
+
         imgs = imgs.to(device)
         depths = depths.to(device)
 
@@ -502,7 +728,8 @@ def train_epoch(
             imgs_foggy, cls_labels, reg_labels = fog_augmenter(imgs, depths)
             imgs_norm = normalize(imgs_foggy)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        grad_norm_value = 0.0
 
         # 在 CUDA 环境下优先启用 AMP，以降低显存压力并提升吞吐。
         if scaler is not None:
@@ -518,7 +745,26 @@ def train_epoch(
                     cfg,
                     device,
                 )
+            loss_value = finite_scalar("loss", loss)
+            det_value = finite_scalar("det_loss", loss_det)
+            cls_value = finite_scalar("fog_cls_loss", loss_cls)
+            reg_value = finite_scalar("fog_reg_loss", loss_reg)
             scaler.scale(loss).backward()
+            if cfg.GRAD_CLIP_NORM > 0:
+                scaler.unscale_(optimizer)
+                grad_norm_value, nonfinite_grad = clip_gradients(
+                    model,
+                    cfg.GRAD_CLIP_NORM,
+                    allow_nonfinite=True,
+                )
+                if nonfinite_grad:
+                    meter["nonfinite_grad_batches"] += 1
+                    if not warned_nonfinite_amp_grad:
+                        print(
+                            "Warning: non-finite grad norm detected after AMP unscale+clip; "
+                            "letting GradScaler decide whether to skip the optimizer step."
+                        )
+                        warned_nonfinite_amp_grad = True
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -533,19 +779,45 @@ def train_epoch(
                 cfg,
                 device,
             )
+            loss_value = finite_scalar("loss", loss)
+            det_value = finite_scalar("det_loss", loss_det)
+            cls_value = finite_scalar("fog_cls_loss", loss_cls)
+            reg_value = finite_scalar("fog_reg_loss", loss_reg)
             loss.backward()
+            if cfg.GRAD_CLIP_NORM > 0:
+                grad_norm_value, _ = clip_gradients(
+                    model,
+                    cfg.GRAD_CLIP_NORM,
+                    allow_nonfinite=False,
+                )
             optimizer.step()
 
-        total_loss += loss.item()
+        meter["loss"] += loss_value
+        meter["det"] += det_value
+        meter["fog_cls"] += cls_value
+        meter["fog_reg"] += reg_value
+        meter["grad_norm"] += grad_norm_value
+        meter["batches"] += 1
         # 进度条里同时展示总损失和三项子损失，便于快速判断哪一项在主导训练。
-        pbar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "det": f"{loss_det.item():.4f}",
-            "fog_cls": f"{loss_cls.item():.4f}",
-            "fog_reg": f"{loss_reg.item():.4f}",
-        })
+        postfix = {
+            "loss": f"{loss_value:.4f}",
+            "det": f"{det_value:.4f}",
+            "fog_cls": f"{cls_value:.4f}",
+            "fog_reg": f"{reg_value:.4f}",
+        }
+        if cfg.GRAD_CLIP_NORM > 0:
+            postfix["grad"] = (
+                f"{grad_norm_value:.4f}"
+                if grad_norm_value > 0
+                else (
+                    "nonfinite"
+                    if meter["nonfinite_grad_batches"] > 0
+                    else f"{grad_norm_value:.4f}"
+                )
+            )
+        pbar.set_postfix(postfix)
 
-    return total_loss / max(len(train_loader), 1)
+    return finalize_epoch_meter(meter)
 
 
 def validate_epoch(
@@ -557,6 +829,7 @@ def validate_epoch(
     criterion_reg,
     cfg,
     device,
+    amp_enabled,
     desc,
 ):
     """
@@ -566,7 +839,7 @@ def validate_epoch(
         return None
 
     model.eval()
-    total_loss = 0.0
+    meter = init_epoch_meter()
     pbar = tqdm(val_loader, desc=desc)
     fork_devices = [torch.cuda.current_device()] if device == "cuda" else []
 
@@ -576,14 +849,17 @@ def validate_epoch(
             torch.cuda.manual_seed_all(1234)
 
         with torch.no_grad():
-            for imgs, depths, det_targets in pbar:
+            for batch_index, (imgs, depths, det_targets) in enumerate(pbar, start=1):
+                if cfg.MAX_VAL_BATCHES > 0 and batch_index > cfg.MAX_VAL_BATCHES:
+                    break
+
                 imgs = imgs.to(device)
                 depths = depths.to(device)
 
                 imgs_foggy, cls_labels, reg_labels = fog_augmenter(imgs, depths)
                 imgs_norm = normalize(imgs_foggy)
 
-                if device == "cuda":
+                if device == "cuda" and amp_enabled:
                     with torch.amp.autocast("cuda"):
                         loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
                             model,
@@ -609,15 +885,26 @@ def validate_epoch(
                         device,
                     )
 
-                total_loss += loss.item()
-                pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "det": f"{loss_det.item():.4f}",
-                    "fog_cls": f"{loss_cls.item():.4f}",
-                    "fog_reg": f"{loss_reg.item():.4f}",
-                })
+                loss_value = finite_scalar("val_loss", loss)
+                det_value = finite_scalar("val_det_loss", loss_det)
+                cls_value = finite_scalar("val_fog_cls_loss", loss_cls)
+                reg_value = finite_scalar("val_fog_reg_loss", loss_reg)
 
-    return total_loss / max(len(val_loader), 1)
+                meter["loss"] += loss_value
+                meter["det"] += det_value
+                meter["fog_cls"] += cls_value
+                meter["fog_reg"] += reg_value
+                meter["batches"] += 1
+                pbar.set_postfix(
+                    {
+                        "loss": f"{loss_value:.4f}",
+                        "det": f"{det_value:.4f}",
+                        "fog_cls": f"{cls_value:.4f}",
+                        "fog_reg": f"{reg_value:.4f}",
+                    }
+                )
+
+    return finalize_epoch_meter(meter)
 
 
 def train():
@@ -644,9 +931,25 @@ def train():
         pass
 
     cfg = Config()
-    set_seed(42)
+    set_seed(cfg.SEED)
     device = cfg.DEVICE
     print(f"Using device: {device}")
+    print(f"Training controls: {cfg.training_controls()}")
+
+    run_dir = make_run_dir(cfg)
+    metrics_jsonl = os.path.join(run_dir, "metrics.jsonl")
+    summary_json = os.path.join(run_dir, "summary.json")
+    config_json = os.path.join(run_dir, "config_snapshot.json")
+    write_json(
+        config_json,
+        {
+            "config_snapshot": build_cfg_snapshot(cfg),
+            "paths": cfg.path_summary(),
+            "training_controls": cfg.training_controls(),
+            "device": device,
+        },
+    )
+    print(f"Run directory: {run_dir}")
 
     print(f"Loading base model: {cfg.YOLO_BASE_MODEL}")
     model = UnifiedMultiTaskModel(
@@ -659,13 +962,18 @@ def train():
     os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
 
-    normalize, train_loader, val_loader, criterion_cls, criterion_reg = build_train_components(cfg, device)
+    normalize, train_loader, val_loader, criterion_cls, criterion_reg = (
+        build_train_components(cfg, device)
+    )
 
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LR)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
-    scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
-    if scaler is not None:
+    amp_enabled = device == "cuda" and not cfg.DISABLE_AMP
+    scaler = torch.amp.GradScaler("cuda") if amp_enabled else None
+    if amp_enabled:
         print("AMP is enabled.")
+    elif device == "cuda":
+        print("AMP is disabled.")
 
     latest_checkpoint = find_latest_checkpoint(cfg.CHECKPOINT_DIR)
     start_epoch = 0
@@ -683,18 +991,25 @@ def train():
                 scaler,
             )
         except Exception as exc:
-            print(f"Checkpoint is incompatible with the current model, restarting from scratch: {exc}")
+            print(
+                f"Checkpoint is incompatible with the current model, restarting from scratch: {exc}"
+            )
             start_epoch = 0
             best_loss = float("inf")
         if start_epoch >= cfg.EPOCHS:
-            print("FP32 training already reached the configured epoch count, skipping FP32 stage.")
+            print(
+                "FP32 training already reached the configured epoch count, skipping FP32 stage."
+            )
             start_epoch = cfg.EPOCHS
     else:
         print("Starting training from scratch.")
 
     print(f"Starting FP32 training for {cfg.EPOCHS} epochs.")
+    phase_summaries: list[dict] = []
+    amp_recovery_events: list[dict] = []
+    nonfinite_fail_streaks = {"fp32": 0, "qat": 0}
     for epoch in range(start_epoch, cfg.EPOCHS):
-        avg_loss = train_epoch(
+        train_metrics = train_epoch(
             model,
             fog_augmenter,
             train_loader,
@@ -707,8 +1022,35 @@ def train():
             device,
             desc=f"Epoch {epoch + 1}/{cfg.EPOCHS}",
         )
-        print(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
-        avg_val_loss = validate_epoch(
+        print(f"Epoch {epoch + 1} average loss: {train_metrics['loss']:.4f}")
+        (
+            nonfinite_message,
+            nonfinite_fail_streaks["fp32"],
+            should_disable_amp,
+        ) = evaluate_nonfinite_grad_health(
+            train_metrics,
+            cfg,
+            phase="fp32",
+            epoch=epoch + 1,
+            consecutive_fail_epochs=nonfinite_fail_streaks["fp32"],
+            amp_enabled=amp_enabled,
+        )
+        if nonfinite_message:
+            print(nonfinite_message)
+        if should_disable_amp:
+            amp_enabled = False
+            scaler = None
+            recovery_event = {
+                "phase": "fp32",
+                "epoch": epoch + 1,
+                "reason": "nonfinite_grad_fail_streak",
+                "new_amp_enabled": amp_enabled,
+            }
+            amp_recovery_events.append(recovery_event)
+            print(
+                "AMP recovery: disabling AMP for subsequent training/validation epochs."
+            )
+        val_metrics = validate_epoch(
             model,
             fog_augmenter,
             val_loader,
@@ -717,20 +1059,38 @@ def train():
             criterion_reg,
             cfg,
             device,
+            amp_enabled,
             desc=f"Val {epoch + 1}/{cfg.EPOCHS}",
         )
-        if avg_val_loss is not None:
-            print(f"Epoch {epoch + 1} validation loss: {avg_val_loss:.4f}")
+        if val_metrics is not None:
+            print(f"Epoch {epoch + 1} validation loss: {val_metrics['loss']:.4f}")
 
-        monitored_loss = avg_val_loss if avg_val_loss is not None else avg_loss
+        monitored_loss = (
+            val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
+        )
         if monitored_loss < best_loss:
             best_loss = monitored_loss
             torch.save(model.state_dict(), best_model_path)
             print(f"Saved best model: {best_model_path}")
 
+        epoch_record = {
+            "phase": "fp32",
+            "epoch": epoch + 1,
+            "train": train_metrics,
+            "val": val_metrics,
+            "lr": optimizer.param_groups[0]["lr"],
+            "best_loss": best_loss,
+            "nonfinite_fail_streak": nonfinite_fail_streaks["fp32"],
+            "amp_enabled": amp_enabled,
+        }
+        append_jsonl(metrics_jsonl, epoch_record)
+        phase_summaries.append(epoch_record)
+
         # 按固定间隔保存 checkpoint，并清理更旧的历史文件。
         if (epoch + 1) % cfg.CHECKPOINT_SAVE_INTERVAL == 0:
-            checkpoint_path = os.path.join(cfg.CHECKPOINT_DIR, f"checkpoint_epoch_{epoch + 1:04d}.pt")
+            checkpoint_path = os.path.join(
+                cfg.CHECKPOINT_DIR, f"checkpoint_epoch_{epoch + 1:04d}.pt"
+            )
             save_checkpoint(
                 checkpoint_path,
                 epoch,
@@ -738,10 +1098,10 @@ def train():
                 optimizer,
                 scheduler,
                 scaler,
-                avg_loss,
+                train_metrics["loss"],
                 best_loss,
                 cfg,
-                val_loss=avg_val_loss,
+                val_loss=val_metrics["loss"] if val_metrics is not None else None,
             )
             prune_old_checkpoints(cfg.CHECKPOINT_DIR, cfg.CHECKPOINT_KEEP_MAX)
 
@@ -751,6 +1111,25 @@ def train():
     fp32_path = os.path.join(cfg.OUTPUT_DIR, "unified_model.pt")
     torch.save(model.state_dict(), fp32_path)
     print(f"Saved FP32 model: {fp32_path}")
+
+    if cfg.SKIP_QAT or cfg.QAT_EPOCHS <= 0:
+        print("Skipping QAT/INT8 stage.")
+        write_json(
+            summary_json,
+            {
+                "status": "completed_fp32_only",
+                "run_dir": run_dir,
+                "fp32_model": fp32_path,
+                "best_fp32_model": best_model_path,
+                "checkpoint_dir": cfg.CHECKPOINT_DIR,
+                "best_loss": best_loss,
+                "amp_recovery_events": amp_recovery_events,
+                "nonfinite_fail_streaks": nonfinite_fail_streaks,
+                "phase_summaries": phase_summaries,
+            },
+        )
+        print(f"Run summary: {summary_json}")
+        return
 
     print(f"Starting QAT training for {cfg.QAT_EPOCHS} epochs.")
     best_loss_qat = float("inf")
@@ -762,13 +1141,19 @@ def train():
     model.to("cpu")
     model.fuse_model()
 
-    backend = "fbgemm" if torch.backends.quantized.supported_engines.count("fbgemm") else "qnnpack"
+    backend = (
+        "fbgemm"
+        if torch.backends.quantized.supported_engines.count("fbgemm")
+        else "qnnpack"
+    )
     model.qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
     torch.ao.quantization.prepare_qat(model, inplace=True)
     model.to(device)
 
     optimizer_qat = optim.AdamW(model.parameters(), lr=cfg.QAT_LR)
-    scheduler_qat = optim.lr_scheduler.CosineAnnealingLR(optimizer_qat, T_max=cfg.QAT_EPOCHS)
+    scheduler_qat = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_qat, T_max=cfg.QAT_EPOCHS
+    )
     # QAT 不与 AMP 混用。
     # fake quant / observer 通常要求 float32 路径，和 autocast 的半精度前向容易产生 dtype 冲突。
     scaler_qat = None
@@ -790,14 +1175,16 @@ def train():
                 print("QAT already reached the configured epoch count, skipping QAT.")
                 qat_start_epoch = cfg.QAT_EPOCHS
         except Exception as exc:
-            print(f"QAT checkpoint is incompatible with the current model, restarting QAT: {exc}")
+            print(
+                f"QAT checkpoint is incompatible with the current model, restarting QAT: {exc}"
+            )
             qat_start_epoch = 0
             best_loss_qat = float("inf")
     else:
         print("Starting QAT from scratch.")
 
     for epoch in range(qat_start_epoch, cfg.QAT_EPOCHS):
-        avg_loss = train_epoch(
+        train_metrics = train_epoch(
             model,
             fog_augmenter,
             train_loader,
@@ -810,8 +1197,22 @@ def train():
             device,
             desc=f"QAT Epoch {epoch + 1}/{cfg.QAT_EPOCHS}",
         )
-        print(f"QAT epoch {epoch + 1} average loss: {avg_loss:.4f}")
-        avg_val_loss = validate_epoch(
+        print(f"QAT epoch {epoch + 1} average loss: {train_metrics['loss']:.4f}")
+        (
+            nonfinite_message,
+            nonfinite_fail_streaks["qat"],
+            _,
+        ) = evaluate_nonfinite_grad_health(
+            train_metrics,
+            cfg,
+            phase="qat",
+            epoch=epoch + 1,
+            consecutive_fail_epochs=nonfinite_fail_streaks["qat"],
+            amp_enabled=False,
+        )
+        if nonfinite_message:
+            print(nonfinite_message)
+        val_metrics = validate_epoch(
             model,
             fog_augmenter,
             val_loader,
@@ -820,16 +1221,34 @@ def train():
             criterion_reg,
             cfg,
             device,
+            False,
             desc=f"QAT Val {epoch + 1}/{cfg.QAT_EPOCHS}",
         )
-        if avg_val_loss is not None:
-            print(f"QAT epoch {epoch + 1} validation loss: {avg_val_loss:.4f}")
+        if val_metrics is not None:
+            print(f"QAT epoch {epoch + 1} validation loss: {val_metrics['loss']:.4f}")
 
-        monitored_loss = avg_val_loss if avg_val_loss is not None else avg_loss
+        monitored_loss = (
+            val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
+        )
         if monitored_loss < best_loss_qat:
             best_loss_qat = monitored_loss
 
-        qat_checkpoint_path = os.path.join(qat_checkpoint_dir, f"checkpoint_epoch_{epoch + 1:04d}.pt")
+        epoch_record = {
+            "phase": "qat",
+            "epoch": epoch + 1,
+            "train": train_metrics,
+            "val": val_metrics,
+            "lr": optimizer_qat.param_groups[0]["lr"],
+            "best_loss": best_loss_qat,
+            "nonfinite_fail_streak": nonfinite_fail_streaks["qat"],
+            "amp_enabled": False,
+        }
+        append_jsonl(metrics_jsonl, epoch_record)
+        phase_summaries.append(epoch_record)
+
+        qat_checkpoint_path = os.path.join(
+            qat_checkpoint_dir, f"checkpoint_epoch_{epoch + 1:04d}.pt"
+        )
         save_checkpoint(
             qat_checkpoint_path,
             epoch,
@@ -837,10 +1256,10 @@ def train():
             optimizer_qat,
             scheduler_qat,
             scaler_qat,
-            avg_loss,
+            train_metrics["loss"],
             best_loss_qat,
             cfg,
-            val_loss=avg_val_loss,
+            val_loss=val_metrics["loss"] if val_metrics is not None else None,
         )
         prune_old_checkpoints(qat_checkpoint_dir, cfg.CHECKPOINT_KEEP_MAX)
 
@@ -879,7 +1298,9 @@ def train():
         if hasattr(module, "activation_post_process"):
             observer = module.activation_post_process
             if hasattr(observer, "min_val") and hasattr(observer, "max_val"):
-                if (observer.min_val == float("inf")).any() or (observer.max_val == float("-inf")).any():
+                if (observer.min_val == float("inf")).any() or (
+                    observer.max_val == float("-inf")
+                ).any():
                     module.activation_post_process = nn.Identity()
                     repaired_observers += 1
     if repaired_observers > 0:
@@ -899,9 +1320,24 @@ def train():
     print(f"INT8 model: {qat_path}")
     print(f"Best FP32 model: {best_model_path}")
     print(f"Checkpoint dir: {cfg.CHECKPOINT_DIR}")
+    write_json(
+        summary_json,
+        {
+            "status": "completed_with_qat",
+            "run_dir": run_dir,
+            "fp32_model": fp32_path,
+            "int8_model": qat_path,
+            "best_fp32_model": best_model_path,
+            "checkpoint_dir": cfg.CHECKPOINT_DIR,
+            "best_loss": best_loss,
+            "best_qat_loss": best_loss_qat,
+            "amp_recovery_events": amp_recovery_events,
+            "nonfinite_fail_streaks": nonfinite_fail_streaks,
+            "phase_summaries": phase_summaries,
+        },
+    )
+    print(f"Run summary: {summary_json}")
 
 
 if __name__ == "__main__":
     train()
-
-

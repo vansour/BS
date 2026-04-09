@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 模型导出脚本
 Model Export Script
@@ -53,7 +53,9 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
     这意味着后续部署侧不仅要做检测后处理，也要接住分类和回归两个分支。
     """
     if onnx is None:
-        raise ImportError("ONNX export requires the 'onnx' package. Install it with `pip install onnx`.")
+        raise ImportError(
+            "ONNX export requires the 'onnx' package. Install it with `pip install onnx`."
+        )
 
     cfg = Config()
     model = UnifiedMultiTaskModel(
@@ -67,7 +69,9 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
     if weights_path and os.path.exists(weights_path):
         report = load_model_weights(model, weights_path, map_location=device)
         skipped_yolo_keys = [
-            key for key in report.get("skipped_mismatched_keys", []) if key.startswith("yolo.")
+            key
+            for key in report.get("skipped_mismatched_keys", [])
+            if key.startswith("yolo.")
         ]
         print(f"Loaded weights from: {weights_path} ({report['source_type']})")
         if report["missing_keys"] or report["unexpected_keys"]:
@@ -84,7 +88,9 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
                 "but box quality requires a checkpoint re-trained with `NUM_DET_CLASSES = 1`."
             )
     else:
-        print(f"Weights were not found at {weights_path}, exporting with random initialization.")
+        print(
+            f"Weights were not found at {weights_path}, exporting with random initialization."
+        )
 
     model.eval()
     model.to(device)
@@ -124,7 +130,7 @@ def get_trt_int8_config_example():
     更适合把示例打印出来，交给目标部署环境参考执行。
     """
     cfg = Config()
-    code_snippet = f'''
+    code_snippet = f"""
 import tensorrt as trt
 
 def build_int8_engine(onnx_file_path, engine_file_path):
@@ -155,7 +161,7 @@ def build_int8_engine(onnx_file_path, engine_file_path):
     engine_bytes = builder.build_serialized_network(network, config)
     with open(engine_file_path, "wb") as f:
         f.write(engine_bytes)
-'''
+"""
     return code_snippet
 
 
@@ -170,10 +176,14 @@ def print_jetson_deployment_tips(onnx_path):
     print("NVIDIA Jetson deployment tips")
     print("=" * 80)
     print("1. Quick validation with trtexec:")
-    print(f"   trtexec --onnx={onnx_path} --saveEngine=model_int8.engine --int8 --fp16 --verbose")
+    print(
+        f"   trtexec --onnx={onnx_path} --saveEngine=model_int8.engine --int8 --fp16 --verbose"
+    )
     print("\n2. Environment:")
     print("   - Make sure JetPack and TensorRT versions match the target device.")
-    print("   - Install pycuda or the official TensorRT Python API if you use Python inference.")
+    print(
+        "   - Install pycuda or the official TensorRT Python API if you use Python inference."
+    )
     print("\n3. Runtime checks:")
     print("   - Use 'jetson_clocks' for max-performance mode.")
     print("   - Validate detection, classification and regression outputs separately.")
@@ -185,11 +195,12 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cfg = Config()
 
-    # 自动解析最合适的权重文件，优先使用正式导出的模型文件。
+    # 自动解析最合适的权重文件，优先使用验证表现最好的模型文件，
+    # 避免默认导出训练结束时的最后状态而回退部署效果。
     weights_path = resolve_model_weights(
         cfg.OUTPUT_DIR,
         cfg.CHECKPOINT_DIR,
-        preferred_files=["unified_model.pt", "unified_model_best.pt"],
+        preferred_files=["unified_model_best.pt", "unified_model.pt"],
     )
     output_onnx = os.path.join(base_dir, "..", "outputs", "unified_multitask.onnx")
     os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
@@ -203,5 +214,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

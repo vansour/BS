@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 全局配置模块
 Centralized Configuration Module
@@ -21,7 +21,31 @@ Centralized Configuration Module
 """
 
 import os
-from pathlib import Path
+
+
+def _resolve_path(base_dir: str, *parts: str, env_var: str | None = None) -> str:
+    """
+    解析配置路径。
+
+    若传入了环境变量名且环境变量有值，则优先使用环境变量中的路径；
+    否则回退到仓库内的默认相对路径。
+    """
+    override = os.getenv(env_var) if env_var else None
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.abspath(os.path.join(base_dir, *parts))
+
+
+def _resolve_device() -> str:
+    """
+    解析默认运行设备。
+
+    允许通过 `BS_DEVICE` 显式覆盖自动探测结果，便于在 CPU/CUDA 之间切换。
+    """
+    override = os.getenv("BS_DEVICE")
+    if override:
+        return override
+    return "cuda" if __import__("torch").cuda.is_available() else "cpu"
 
 
 class Config:
@@ -45,18 +69,43 @@ class Config:
 
     # ==================== 数据路径 ====================
     # 原始晴天数据目录，默认指向 UA-DETRAC 训练集图片目录。
-    RAW_DATA_DIR = os.path.join(
-        BASE_DIR, "..", "data", "UA-DETRAC", "DETRAC-train-data", "Insight-MVT_Annotation_Train"
+    RAW_DATA_DIR = _resolve_path(
+        BASE_DIR,
+        "..",
+        "data",
+        "UA-DETRAC",
+        "DETRAC-train-data",
+        "Insight-MVT_Annotation_Train",
+        env_var="BS_RAW_DATA_DIR",
     )
     # UA-DETRAC XML 标注目录，用于检测分支监督。
-    XML_DIR = os.path.join(BASE_DIR, "..", "data", "UA-DETRAC", "DETRAC-Train-Annotations-XML")
+    XML_DIR = _resolve_path(
+        BASE_DIR,
+        "..",
+        "data",
+        "UA-DETRAC",
+        "DETRAC-Train-Annotations-XML",
+        env_var="BS_XML_DIR",
+    )
     # 深度图缓存目录，用于存储 MiDaS 预计算结果，避免训练时重复推理。
-    DEPTH_CACHE_DIR = os.path.join(BASE_DIR, "..", "outputs", "Depth_Cache")
+    DEPTH_CACHE_DIR = _resolve_path(
+        BASE_DIR,
+        "..",
+        "outputs",
+        "Depth_Cache",
+        env_var="BS_DEPTH_CACHE_DIR",
+    )
     # 统一模型、日志和导出结果的输出目录。
-    OUTPUT_DIR = os.path.join(BASE_DIR, "..", "outputs", "Fog_Detection_Project")
+    OUTPUT_DIR = _resolve_path(
+        BASE_DIR,
+        "..",
+        "outputs",
+        "Fog_Detection_Project",
+        env_var="BS_OUTPUT_DIR",
+    )
 
     # ==================== 模型配置 ====================
-    YOLO_BASE_MODEL = "yolo11n.pt"
+    YOLO_BASE_MODEL = os.getenv("BS_YOLO_BASE_MODEL", "yolo11n.pt")
     # 当前检测任务明确收敛为单类 `vehicle`。
     # 训练、推理和导出都按单类检测头组织，不再保留 COCO 80 类的过渡逻辑。
     NUM_DET_CLASSES = 1
@@ -67,23 +116,50 @@ class Config:
     FOG_CLASS_NAMES = ["clear", "uniform", "patchy"]
 
     # ==================== 训练超参数 ====================
-    BATCH_SIZE = 16
-    EPOCHS = 30
-    LR = 1e-4
-    QAT_EPOCHS = 5
-    QAT_LR = 1e-5
-    IMG_SIZE = 512  # 默认使用更轻量的训练输入尺度以提升迭代速度。
+    BATCH_SIZE = max(1, int(os.getenv("BS_BATCH_SIZE", "16")))
+    EPOCHS = max(1, int(os.getenv("BS_EPOCHS", "30")))
+    LR = float(os.getenv("BS_LR", "1e-4"))
+    QAT_EPOCHS = max(0, int(os.getenv("BS_QAT_EPOCHS", "5")))
+    QAT_LR = float(os.getenv("BS_QAT_LR", "1e-5"))
+    IMG_SIZE = max(
+        32, int(os.getenv("BS_IMG_SIZE", "512"))
+    )  # 默认使用更轻量的训练输入尺度以提升迭代速度。
     # 允许通过环境变量在不改源码的情况下控制帧抽样步长。
     # 例如 BS_FRAME_STRIDE=5 表示每 5 帧取 1 帧，可用于快速烟雾测试或减轻训练压力。
     FRAME_STRIDE = max(1, int(os.getenv("BS_FRAME_STRIDE", "1")))
+    TRAIN_RATIO = min(1.0, max(0.0, float(os.getenv("BS_TRAIN_RATIO", "0.8"))))
 
     # 是否在正式训练前强制执行深度缓存预计算流程。
     # 即使默认关闭，训练脚本现在也会在发现 train/val 任一侧缺失缓存时自动补齐，
     # 以避免训练或验证阶段因缺少 `.npy` 文件而中途崩溃。
     # 显式开启后则会无条件进入预计算流程（内部仍只对缺失文件真正写盘）。
     PRECOMPUTE_DEPTH_CACHE = os.getenv("BS_PRECOMPUTE_DEPTH_CACHE", "0").lower() in {
-        "1", "true", "yes", "on"
+        "1",
+        "true",
+        "yes",
+        "on",
     }
+    SKIP_QAT = os.getenv("BS_SKIP_QAT", "0").lower() in {"1", "true", "yes", "on"}
+    DISABLE_AMP = os.getenv("BS_DISABLE_AMP", "0").lower() in {"1", "true", "yes", "on"}
+    MAX_TRAIN_BATCHES = max(0, int(os.getenv("BS_MAX_TRAIN_BATCHES", "0")))
+    MAX_VAL_BATCHES = max(0, int(os.getenv("BS_MAX_VAL_BATCHES", "0")))
+    GRAD_CLIP_NORM = max(0.0, float(os.getenv("BS_GRAD_CLIP_NORM", "0")))
+    NONFINITE_GRAD_MIN_BATCHES = max(
+        1, int(os.getenv("BS_NONFINITE_GRAD_MIN_BATCHES", "20"))
+    )
+    NONFINITE_GRAD_WARN_RATIO = max(
+        0.0, float(os.getenv("BS_NONFINITE_GRAD_WARN_RATIO", "0.05"))
+    )
+    NONFINITE_GRAD_FAIL_RATIO = max(
+        0.0, float(os.getenv("BS_NONFINITE_GRAD_FAIL_RATIO", "0.2"))
+    )
+    NONFINITE_GRAD_FAIL_STREAK = max(
+        1, int(os.getenv("BS_NONFINITE_GRAD_FAIL_STREAK", "1"))
+    )
+    NONFINITE_GRAD_AUTO_DISABLE_AMP = os.getenv(
+        "BS_NONFINITE_GRAD_AUTO_DISABLE_AMP", "1"
+    ).lower() in {"1", "true", "yes", "on"}
+    SEED = int(os.getenv("BS_SEED", "42"))
 
     # DataLoader 相关参数也允许通过环境变量覆盖，便于针对不同机器微调吞吐。
     CPU_COUNT = os.cpu_count() or 4
@@ -94,16 +170,31 @@ class Config:
     )
     NUM_WORKERS = max(0, int(os.getenv("BS_NUM_WORKERS", str(DEFAULT_NUM_WORKERS))))
     DEFAULT_PREFETCH_FACTOR = 4 if os.name == "nt" else 2
-    PREFETCH_FACTOR = max(2, int(os.getenv("BS_PREFETCH_FACTOR", str(DEFAULT_PREFETCH_FACTOR))))
+    PREFETCH_FACTOR = max(
+        2, int(os.getenv("BS_PREFETCH_FACTOR", str(DEFAULT_PREFETCH_FACTOR)))
+    )
     PERSISTENT_WORKERS = os.getenv(
         "BS_PERSISTENT_WORKERS",
         "1" if NUM_WORKERS > 0 else "0",
     ).lower() in {"1", "true", "yes", "on"}
 
     # ==================== 检查点配置 ====================
-    CHECKPOINT_DIR = os.path.join(BASE_DIR, "..", "outputs", "Fog_Detection_Project", "checkpoints")
-    CHECKPOINT_SAVE_INTERVAL = 1  # 每隔多少个 epoch 保存一次 checkpoint。
-    CHECKPOINT_KEEP_MAX = 5  # 最多保留的历史 checkpoint 数量。
+    CHECKPOINT_DIR = _resolve_path(
+        BASE_DIR,
+        "..",
+        "outputs",
+        "Fog_Detection_Project",
+        "checkpoints",
+        env_var="BS_CHECKPOINT_DIR",
+    )
+    if os.getenv("BS_CHECKPOINT_DIR") is None:
+        CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+    CHECKPOINT_SAVE_INTERVAL = max(
+        1, int(os.getenv("BS_CHECKPOINT_SAVE_INTERVAL", "1"))
+    )  # 每隔多少个 epoch 保存一次 checkpoint。
+    CHECKPOINT_KEEP_MAX = max(
+        0, int(os.getenv("BS_CHECKPOINT_KEEP_MAX", "5"))
+    )  # 最多保留的历史 checkpoint 数量。
 
     # ==================== 物理参数（大气散射模型） ====================
     BETA_MIN = 0.02
@@ -114,7 +205,7 @@ class Config:
     # ==================== 设备配置 ====================
     # 在导入配置时就根据当前环境探测默认设备。
     # 这样训练、推理和导出脚本都能共享同一套设备选择逻辑。
-    DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+    DEVICE = _resolve_device()
 
     # ==================== 推理配置 ====================
     BASE_CONF_THRES = 0.25
@@ -144,16 +235,73 @@ class Config:
         """
         os.makedirs(self.DEPTH_CACHE_DIR, exist_ok=True)
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(self.CHECKPOINT_DIR, exist_ok=True)
+
+    def path_summary(self) -> dict[str, str]:
+        """
+        返回当前运行时最关键的路径配置。
+
+        该方法主要服务于自检脚本、日志打印和问题排查。
+        """
+        return {
+            "raw_data_dir": self.RAW_DATA_DIR,
+            "xml_dir": self.XML_DIR,
+            "depth_cache_dir": self.DEPTH_CACHE_DIR,
+            "output_dir": self.OUTPUT_DIR,
+            "checkpoint_dir": self.CHECKPOINT_DIR,
+        }
+
+    def training_controls(self) -> dict[str, int | float | bool]:
+        """
+        返回训练阶段的关键控制参数。
+
+        该方法主要服务于日志记录、smoke run 排查和实验复现。
+        """
+        return {
+            "batch_size": self.BATCH_SIZE,
+            "epochs": self.EPOCHS,
+            "lr": self.LR,
+            "qat_epochs": self.QAT_EPOCHS,
+            "qat_lr": self.QAT_LR,
+            "img_size": self.IMG_SIZE,
+            "frame_stride": self.FRAME_STRIDE,
+            "train_ratio": self.TRAIN_RATIO,
+            "max_train_batches": self.MAX_TRAIN_BATCHES,
+            "max_val_batches": self.MAX_VAL_BATCHES,
+            "grad_clip_norm": self.GRAD_CLIP_NORM,
+            "nonfinite_grad_min_batches": self.NONFINITE_GRAD_MIN_BATCHES,
+            "nonfinite_grad_warn_ratio": self.NONFINITE_GRAD_WARN_RATIO,
+            "nonfinite_grad_fail_ratio": self.NONFINITE_GRAD_FAIL_RATIO,
+            "nonfinite_grad_fail_streak": self.NONFINITE_GRAD_FAIL_STREAK,
+            "nonfinite_grad_auto_disable_amp": self.NONFINITE_GRAD_AUTO_DISABLE_AMP,
+            "skip_qat": self.SKIP_QAT,
+            "disable_amp": self.DISABLE_AMP,
+            "seed": self.SEED,
+        }
 
     def __repr__(self):
         """返回配置摘要，便于调试和日志打印。"""
-        return (f"Config(BASE_DIR={self.BASE_DIR}, "
-                f"DEVICE={self.DEVICE}, "
-                f"NUM_DET_CLASSES={self.NUM_DET_CLASSES}, "
-                f"BETA_RANGE=[{self.BETA_MIN}, {self.BETA_MAX}], "
-                f"FRAME_STRIDE={self.FRAME_STRIDE}, "
-                f"PRECOMPUTE_DEPTH_CACHE={self.PRECOMPUTE_DEPTH_CACHE}, "
-                f"NUM_WORKERS={self.NUM_WORKERS})")
+        return (
+            f"Config(BASE_DIR={self.BASE_DIR}, "
+            f"DEVICE={self.DEVICE}, "
+            f"NUM_DET_CLASSES={self.NUM_DET_CLASSES}, "
+            f"BETA_RANGE=[{self.BETA_MIN}, {self.BETA_MAX}], "
+            f"FRAME_STRIDE={self.FRAME_STRIDE}, "
+            f"TRAIN_RATIO={self.TRAIN_RATIO}, "
+            f"PRECOMPUTE_DEPTH_CACHE={self.PRECOMPUTE_DEPTH_CACHE}, "
+            f"NUM_WORKERS={self.NUM_WORKERS}, "
+            f"BATCH_SIZE={self.BATCH_SIZE}, "
+            f"EPOCHS={self.EPOCHS}, "
+            f"QAT_EPOCHS={self.QAT_EPOCHS}, "
+            f"MAX_TRAIN_BATCHES={self.MAX_TRAIN_BATCHES}, "
+            f"MAX_VAL_BATCHES={self.MAX_VAL_BATCHES}, "
+            f"NONFINITE_GRAD_WARN_RATIO={self.NONFINITE_GRAD_WARN_RATIO}, "
+            f"NONFINITE_GRAD_FAIL_RATIO={self.NONFINITE_GRAD_FAIL_RATIO}, "
+            f"NONFINITE_GRAD_FAIL_STREAK={self.NONFINITE_GRAD_FAIL_STREAK}, "
+            f"NONFINITE_GRAD_AUTO_DISABLE_AMP={self.NONFINITE_GRAD_AUTO_DISABLE_AMP}, "
+            f"SKIP_QAT={self.SKIP_QAT}, "
+            f"DISABLE_AMP={self.DISABLE_AMP})"
+        )
 
 
 def get_default_config() -> Config:
@@ -171,3 +319,4 @@ def get_default_config() -> Config:
 if __name__ == "__main__":
     cfg = Config()
     print(cfg)
+    print(cfg.path_summary())

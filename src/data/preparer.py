@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 数据集准备器
 Dataset Preparer
@@ -19,13 +19,14 @@ Dataset Preparer
 """
 
 import os
-import random
 import re
 import shutil
 import xml.etree.ElementTree as ET
 
 import cv2
 from tqdm import tqdm
+
+from src.utils import split_sequence_names
 
 
 class DatasetPreparer:
@@ -38,7 +39,14 @@ class DatasetPreparer:
     当前实现默认将所有目标统一映射为单一类别 `vehicle`，与项目现阶段的检测设置保持一致。
     """
 
-    def __init__(self, xml_dir, foggy_image_root, output_dataset_dir, train_ratio=0.8):
+    def __init__(
+        self,
+        xml_dir,
+        foggy_image_root,
+        output_dataset_dir,
+        train_ratio=0.8,
+        split_seed=42,
+    ):
         """
         初始化数据集准备器。
 
@@ -47,6 +55,7 @@ class DatasetPreparer:
             foggy_image_root: 已生成雾天图像的根目录，内部包含多个 `*_Foggy` 子目录。
             output_dataset_dir: 输出的 YOLO 数据集根目录。
             train_ratio: 训练集所占的视频序列比例。
+            split_seed: 序列级切分的随机种子。
 
         `stats` 用于累计最终转换结果，以便在流程结束后输出清晰的样本统计摘要。
         """
@@ -54,6 +63,7 @@ class DatasetPreparer:
         self.foggy_image_root = foggy_image_root
         self.output_dir = output_dataset_dir
         self.train_ratio = train_ratio
+        self.split_seed = int(split_seed)
 
         self.stats = {
             "train_images": 0,
@@ -85,6 +95,18 @@ class DatasetPreparer:
         h = box[3]
         return (x * dw, y * dh, w * dw, h * dh)
 
+    @staticmethod
+    def build_output_image_name(sequence_name, img_file):
+        """
+        为导出的 YOLO 样本生成全局唯一文件名。
+
+        UA-DETRAC 不同序列会重复使用 `img00001.jpg` 这类帧名。
+        若直接把所有图像写入扁平化的 `images/train` 或 `images/val`，
+        后处理序列会覆盖前面的样本。这里统一加上序列名前缀，
+        保持当前目录结构不变的同时消除命名冲突。
+        """
+        return f"{sequence_name}_{img_file}"
+
     def parse_xml_sequence(self, xml_file):
         """
         解析单个视频序列的 XML 标注文件。
@@ -115,14 +137,16 @@ class DatasetPreparer:
                     box = target.find("box")
                     if box is None:
                         continue
-                    objects.append({
-                        "bbox": [
-                            float(box.get("left")),
-                            float(box.get("top")),
-                            float(box.get("width")),
-                            float(box.get("height")),
-                        ]
-                    })
+                    objects.append(
+                        {
+                            "bbox": [
+                                float(box.get("left")),
+                                float(box.get("top")),
+                                float(box.get("width")),
+                                float(box.get("height")),
+                            ]
+                        }
+                    )
             sequence_data[frame_num] = objects
 
         return sequence_data
@@ -161,7 +185,8 @@ class DatasetPreparer:
         # 收集所有已经生成好的雾天序列目录。
         # 这些目录名默认形如 `MVI_xxx_Foggy`，后面会通过去掉 `_Foggy` 找到原 XML 名称。
         foggy_folders = [
-            d for d in os.listdir(self.foggy_image_root)
+            d
+            for d in os.listdir(self.foggy_image_root)
             if os.path.isdir(os.path.join(self.foggy_image_root, d))
         ]
         print(f"发现 {len(foggy_folders)} 个已处理序列，开始转换。")
@@ -171,11 +196,15 @@ class DatasetPreparer:
             print("请确认已下载并放置 `DETRAC-Train-Annotations-XML` 数据。")
             return
 
-        # 按序列随机打乱并划分训练/验证集，避免单帧级划分造成泄漏。
-        random.shuffle(foggy_folders)
-        split_idx = int(len(foggy_folders) * self.train_ratio)
-        train_sequences = set(foggy_folders[:split_idx])
-        val_sequences = set(foggy_folders[split_idx:])
+        # 按序列做有种子的随机切分，避免单帧级划分造成泄漏，
+        # 同时保证多次运行可复现。
+        train_sequence_list, val_sequence_list = split_sequence_names(
+            foggy_folders,
+            train_ratio=self.train_ratio,
+            seed=self.split_seed,
+        )
+        train_sequences = set(train_sequence_list)
+        val_sequences = set(val_sequence_list)
 
         self.stats["train_sequences"] = len(train_sequences)
         self.stats["val_sequences"] = len(val_sequences)
@@ -230,14 +259,21 @@ class DatasetPreparer:
                 if not label_lines:
                     continue
 
+                output_image_name = self.build_output_image_name(
+                    sequence_name, img_file
+                )
+
                 # 图像和标签分别写入标准 YOLO 目录。
                 shutil.copy(
                     os.path.join(foggy_seq_path, img_file),
-                    os.path.join(self.output_dir, "images", subset, img_file),
+                    os.path.join(self.output_dir, "images", subset, output_image_name),
                 )
 
                 label_save_path = os.path.join(
-                    self.output_dir, "labels", subset, img_file.replace(".jpg", ".txt")
+                    self.output_dir,
+                    "labels",
+                    subset,
+                    os.path.splitext(output_image_name)[0] + ".txt",
                 )
                 with open(label_save_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(label_lines))
@@ -254,8 +290,12 @@ class DatasetPreparer:
         print("\n" + "=" * 50)
         print("数据集统计信息")
         print("=" * 50)
-        print(f"训练集: {self.stats['train_sequences']} 个序列，{self.stats['train_images']} 张图像")
-        print(f"验证集: {self.stats['val_sequences']} 个序列，{self.stats['val_images']} 张图像")
+        print(
+            f"训练集: {self.stats['train_sequences']} 个序列，{self.stats['train_images']} 张图像"
+        )
+        print(
+            f"验证集: {self.stats['val_sequences']} 个序列，{self.stats['val_images']} 张图像"
+        )
         denominator = self.stats["train_images"] + self.stats["val_images"]
         if denominator > 0:
             train_p = self.stats["train_images"] / denominator * 100
@@ -270,13 +310,19 @@ class DatasetPreparer:
         当前任务只保留一个检测类别：`vehicle`。
         """
         # path 使用绝对路径，避免从不同工作目录启动 YOLO 训练时路径解析混乱。
-        yaml_content = "\n".join([
-            f"path: {os.path.abspath(self.output_dir)}",
-            "train: images/train",
-            "val: images/val",
-            "nc: 1",
-            "names: ['vehicle']",
-        ]) + "\n"
-        with open(os.path.join(self.output_dir, "data.yaml"), "w", encoding="utf-8") as f:
+        yaml_content = (
+            "\n".join(
+                [
+                    f"path: {os.path.abspath(self.output_dir)}",
+                    "train: images/train",
+                    "val: images/val",
+                    "nc: 1",
+                    "names: ['vehicle']",
+                ]
+            )
+            + "\n"
+        )
+        with open(
+            os.path.join(self.output_dir, "data.yaml"), "w", encoding="utf-8"
+        ) as f:
             f.write(yaml_content)
-

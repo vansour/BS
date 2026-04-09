@@ -46,6 +46,13 @@ Thumbs.db
 outputs/
 # 大文件数据集，不纳入版本控制
 data/UA-DETRAC/
+data/*.zip
+data/*.tar
+data/*.tar.gz
+data/*.tgz
+data/*.7z
+data/DETRAC-*/
+data/Insight-MVT_Annotation_*/
 *.mp4
 *.avi
 

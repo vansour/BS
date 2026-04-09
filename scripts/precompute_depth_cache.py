@@ -37,7 +37,9 @@ def count_depth_cache_files(depth_cache_dir: str) -> int:
     return sum(1 for path in Path(depth_cache_dir).glob("*.npy") if path.is_file())
 
 
-def count_missing_depth_cache_for_dataset(dataset: MultiTaskDataset) -> tuple[int, list[str]]:
+def count_missing_depth_cache_for_dataset(
+    dataset: MultiTaskDataset,
+) -> tuple[int, list[str]]:
     """
     统计指定数据集缺失的深度缓存数量，并返回少量样例文件名。
     """
@@ -76,6 +78,8 @@ def main():
         transform=None,
         is_train=True,
         frame_stride=cfg.FRAME_STRIDE,
+        train_ratio=cfg.TRAIN_RATIO,
+        split_seed=cfg.SEED,
     )
     val_dataset = MultiTaskDataset(
         cfg.RAW_DATA_DIR,
@@ -84,18 +88,26 @@ def main():
         transform=None,
         is_train=False,
         frame_stride=cfg.FRAME_STRIDE,
+        train_ratio=cfg.TRAIN_RATIO,
+        split_seed=cfg.SEED,
     )
 
     train_samples = len(train_dataset)
     val_samples = len(val_dataset)
     total_samples = train_samples + val_samples
     cache_before = count_depth_cache_files(cfg.DEPTH_CACHE_DIR)
-    train_missing_before, train_missing_examples = count_missing_depth_cache_for_dataset(train_dataset)
-    val_missing_before, val_missing_examples = count_missing_depth_cache_for_dataset(val_dataset)
+    train_missing_before, train_missing_examples = (
+        count_missing_depth_cache_for_dataset(train_dataset)
+    )
+    val_missing_before, val_missing_examples = count_missing_depth_cache_for_dataset(
+        val_dataset
+    )
     missing_before = train_missing_before + val_missing_before
 
     print(f"Using device: {cfg.DEVICE}")
     print(f"Frame stride: {cfg.FRAME_STRIDE}")
+    print(f"Train ratio: {cfg.TRAIN_RATIO}")
+    print(f"Split seed: {cfg.SEED}")
     print(f"Training samples: {train_samples}")
     print(f"Validation samples: {val_samples}")
     print(f"Total samples: {total_samples}")
@@ -112,7 +124,9 @@ def main():
         raise RuntimeError(f"Train/val datasets are empty: {cfg.RAW_DATA_DIR}")
 
     if missing_before == 0:
-        print("Depth cache is already complete for both training and validation datasets. No work needed.")
+        print(
+            "Depth cache is already complete for both training and validation datasets. No work needed."
+        )
         return
 
     if train_missing_before > 0:
@@ -133,9 +147,13 @@ def main():
     print(f"Missing depth files after: {missing_after}")
 
     if missing_after > 0:
-        print("Some depth files are still missing. Review the log above for failed images.")
+        print(
+            "Some depth files are still missing. Review the log above for failed images."
+        )
     else:
-        print("Depth cache precomputation completed successfully for both training and validation datasets.")
+        print(
+            "Depth cache precomputation completed successfully for both training and validation datasets."
+        )
 
 
 if __name__ == "__main__":
