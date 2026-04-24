@@ -373,6 +373,25 @@ python src/train.py
 - `outputs/Fog_Detection_Project/runs/<run_name>/metrics.jsonl`
 - `outputs/Fog_Detection_Project/runs/<run_name>/summary.json`
 
+如果希望补正式的雾头实验，而不是继续做 smoke run，仓库里已经提供了一条固定化命令：
+
+```bash
+bash scripts/run_fogfocus_full_train.sh
+```
+
+该脚本默认会：
+
+- 从 `outputs/Fog_Detection_Project_fogfocus/checkpoints/checkpoint_epoch_0004.pt` 继续训练
+- `FREEZE_YOLO_FOR_FOG=1`
+- `DET_LOSS_WEIGHT=0`
+- 去掉 `MAX_TRAIN_BATCHES / MAX_VAL_BATCHES` 限制
+- 输出到 `outputs/Fog_Detection_Project_fogfocus_full/`
+
+与这条训练脚本配套的实验资产包括：
+
+- `docs/experiments/fogfocus_fulltrain_record_template.md`
+- `docs/experiments/thesis_result_tables_template.md`
+
 ### 6. 推理
 
 ```bash
