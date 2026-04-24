@@ -401,6 +401,27 @@ python src/export.py
 python scripts/generate_line_by_line_docs.py
 ```
 
+### 9. 对比统一推理与混合方案
+
+该脚本会离线采样视频帧，对比：
+
+- 统一模型方案：`HighwayFogSystem`
+- 混合方案：`HighwayFogSystem` + 独立 `yolo11n.pt`
+
+输出包括：
+
+- `outputs/Route_Eval/route_eval_summary.json`
+- `outputs/Route_Eval/route_eval_summary.md`
+- 每个视频一个 `frame_metrics.csv`
+- 若干差异代表帧 `preview_*.jpg`
+
+```bash
+python scripts/evaluate_inference_routes.py \
+  --video gettyimages-1353950094-640_adpp.mp4 \
+  --sample-stride 5 \
+  --max-frames 300
+```
+
 ## 训练相关环境变量
 
 `src/config.py` 和 `src/utils.py` 当前支持通过环境变量做轻量覆盖：
@@ -536,6 +557,7 @@ python scripts/generate_line_by_line_docs.py
 - [scripts/smoke_test.py](./scripts/smoke_test.py)：训练前自检
 - [scripts/check_dataset.py](./scripts/check_dataset.py)：数据审计与样例可视化
 - [scripts/hybrid_fog_vehicle_infer.py](./scripts/hybrid_fog_vehicle_infer.py)：混合推理演示
+- [scripts/evaluate_inference_routes.py](./scripts/evaluate_inference_routes.py)：统一推理与混合方案的离线对比评估
 - [scripts/adapt_fog_to_video.py](./scripts/adapt_fog_to_video.py)：面向目标视频的雾头适配
 
 ## 总结
