@@ -66,6 +66,17 @@ class FogAugmentation(nn.Module):
         """
         super().__init__()
         self.cfg = cfg
+        fog_probs = torch.tensor(
+            [
+                float(self.cfg.FOG_CLEAR_PROB),
+                float(self.cfg.FOG_UNIFORM_PROB),
+                float(self.cfg.FOG_PATCHY_PROB),
+            ],
+            dtype=torch.float32,
+        )
+        if float(fog_probs.sum().item()) <= 0:
+            raise ValueError("Fog sampling probabilities must sum to a positive value.")
+        self.register_buffer("fog_type_probs", fog_probs / fog_probs.sum())
 
     def forward(self, images, depths):
         """
@@ -101,7 +112,11 @@ class FogAugmentation(nn.Module):
         # - 一部分保持原样的 clear；
         # - 一部分全局一致衰减的 uniform fog；
         # - 一部分局部浓淡变化的 patchy fog。
-        fog_types = torch.randint(0, 3, (B,), device=device)
+        fog_types = torch.multinomial(
+            self.fog_type_probs.to(device),
+            num_samples=B,
+            replacement=True,
+        )
 
         # 2. 为每个样本采样大气散射参数。
         # beta 控制散射强度，数值越大通常意味着雾越浓；
@@ -109,7 +124,8 @@ class FogAugmentation(nn.Module):
         #
         # betas: (B,)
         # A:     (B, 1, 1, 1)，便于后续广播到整张图像。
-        betas = torch.rand(B, device=device) * (self.cfg.BETA_MAX - self.cfg.BETA_MIN) + self.cfg.BETA_MIN
+        beta_min = float(getattr(self.cfg, "FOG_BETA_MIN", self.cfg.BETA_MIN))
+        betas = torch.rand(B, device=device) * (self.cfg.BETA_MAX - beta_min) + beta_min
         A = torch.rand(B, 1, 1, 1, device=device) * (self.cfg.A_MAX - self.cfg.A_MIN) + self.cfg.A_MIN
 
         # 从原图复制一份作为输出容器，避免直接修改输入张量。
@@ -133,7 +149,9 @@ class FogAugmentation(nn.Module):
             # 通过放大深度范围增强远处区域的衰减效果。
             # 这是一个经验系数，不是物理常数，作用是让合成结果在视觉上
             # 更明显，从而给分类与回归任务提供更可学习的差异。
-            effective_depth = b_depth * 5.0
+            effective_depth = b_depth * float(
+                getattr(self.cfg, "UNIFORM_DEPTH_SCALE", 5.0)
+            )
             transmission = torch.exp(-b_beta * effective_depth)
 
             # 对透射率进行裁剪，避免极端值导致：
@@ -166,7 +184,11 @@ class FogAugmentation(nn.Module):
             # 这里没有直接把噪声当成最终雾图叠加，而是让噪声先影响
             # “有效深度”，再通过 transmission 进入散射公式。
             # 这样生成的团雾仍然保留“远处更容易被雾遮挡”的基本规律。
-            effective_depth = b_depth * (noise * 8.0)
+            patchy_depth_base = float(getattr(self.cfg, "PATCHY_DEPTH_BASE", 0.0))
+            patchy_noise_scale = float(
+                getattr(self.cfg, "PATCHY_DEPTH_NOISE_SCALE", 8.0)
+            )
+            effective_depth = b_depth * (patchy_depth_base + noise * patchy_noise_scale)
             transmission = torch.exp(-b_beta * effective_depth)
             transmission = torch.clamp(transmission, 0.05, 0.95)
             foggy_images[idx] = images[idx] * transmission + b_A * (1 - transmission)
@@ -184,6 +206,5 @@ class FogAugmentation(nn.Module):
                 f"  beta_range=[{self.cfg.BETA_MIN}, {self.cfg.BETA_MAX}],\n"
                 f"  A_range=[{self.cfg.A_MIN}, {self.cfg.A_MAX}]\n"
                 f")")
-
 
 

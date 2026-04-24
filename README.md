@@ -1,6 +1,6 @@
 # 高速公路团雾监测项目 README
 
-更新日期：2026-04-07
+更新日期：2026-04-24
 
 ## 项目概述
 
@@ -36,12 +36,14 @@
 当前工作区的真实状态也需要明确说明：
 
 - UA-DETRAC 数据当前已经整理到 `data/UA-DETRAC/...` 目录结构下，与 [src/config.py](./src/config.py) 的默认路径约定一致
-- `outputs/Depth_Cache/`、`outputs/Fog_Detection_Project/` 和 `checkpoints/` 会在首次运行配置或训练脚本时自动创建，但不随 Git 提交
-- 当前工作区未附带现成训练权重、checkpoint、ONNX 或 INT8 引擎文件
+- `outputs/Depth_Cache/`、`outputs/Fog_Detection_Project/` 以及其下的 `checkpoints/` 会在首次运行配置或训练脚本时自动创建，但不随 Git 提交
+- 当前默认输出目录下已经存在 `unified_model.pt`、`unified_model_best.pt` 和 `checkpoint_epoch_0001.pt` ~ `checkpoint_epoch_0003.pt`
+- `outputs/unified_multitask.onnx` 当前也已经存在；但 TensorRT `engine` 和 INT8 导出产物在当前工作区中仍未发现
+- `outputs/` 下还存在多组历史实验目录（如 `Fog_Detection_Project_fogbalance`、`Fog_Detection_Project_videoadapt` 等），但当前默认配置仍指向 `outputs/Fog_Detection_Project`
 - 根目录现已提供 `requirements.txt` 和 `requirements-dev.txt`，用于补齐核心运行依赖与开发工具依赖
 - 根目录现已提供 [scripts/smoke_test.py](./scripts/smoke_test.py)，用于做阶段一的训练前自检
 
-这意味着：代码主线已经打通，但模型效果、权重文件和导出产物是否存在，取决于当前工作区是否实际执行过训练或导出。
+这意味着：代码主线已经打通，而且当前工作区里确实存在一批训练和导出产物；但这些产物属于“当前这份工作区的真实状态”，不能等同于任意新克隆环境里的默认事实。默认输出目录下现有 run 记录以 `smoke_*` 为主，因此这些权重更适合视为链路验证或阶段性实验产物，而不是自动认定为最终正式模型。
 
 ## 技术路线
 
@@ -130,7 +132,11 @@ flowchart TD
 
 `Loss_total = w_det * Loss_det + w_cls * Loss_fog_cls + w_reg * Loss_fog_reg`
 
-默认三个权重都为 `1.0`。
+当前代码默认权重为：
+
+- `DET_LOSS_WEIGHT = 1.0`
+- `FOG_CLS_LOSS_WEIGHT = 1.5`
+- `FOG_REG_LOSS_WEIGHT = 1.25`
 
 ### 5. 推理与动态阈值
 
@@ -150,17 +156,31 @@ flowchart TD
 当前仓库的主要结构如下：
 
 ```text
-D:\BS
-├─ config.py                     # 旧 checkpoint 兼容层
-├─ pyproject.toml                # 格式化 / 类型检查配置
+BS/
+├─ config.py                          # 旧 checkpoint 兼容层
+├─ pyproject.toml                     # black / ruff / mypy 配置
+├─ requirements.txt
+├─ requirements-dev.txt
 ├─ README.md
-├─ configs/                      # YAML 示例配置，不是主流程真实配置源
-├─ data/                         # UA-DETRAC 原始数据
-├─ outputs/                      # 运行产物（已被 .gitignore 忽略）
-├─ python/                       # 本地 Python 运行环境
+├─ yolo11n.pt                         # 当前工作区中的本地基础权重
+├─ configs/                           # YAML 示例配置，不是主流程真实配置源
+├─ data/
+│  ├─ UA-DETRAC/                      # 当前已整理好的真实数据目录
+│  └─ *.zip                           # 原始压缩包缓存
+├─ outputs/
+│  ├─ Depth_Cache/                    # MiDaS 深度缓存
+│  ├─ Fog_Detection_Project/          # 当前默认输出目录
+│  ├─ Fog_Detection_Project_*/        # 历史实验输出目录
+│  ├─ Data_Audit/                     # 数据审计报告与可视化
+│  ├─ hybrid_infer/                   # 混合推理视频输出
+│  └─ unified_multitask.onnx          # 当前已导出的 ONNX
 ├─ scripts/
-│  ├─ generate_line_by_line_docs.py
-│  └─ precompute_depth_cache.py
+│  ├─ smoke_test.py
+│  ├─ check_dataset.py
+│  ├─ precompute_depth_cache.py
+│  ├─ hybrid_fog_vehicle_infer.py
+│  ├─ adapt_fog_to_video.py
+│  └─ generate_line_by_line_docs.py
 └─ src/
    ├─ config.py
    ├─ train.py
@@ -178,7 +198,7 @@ D:\BS
 
 ## 数据资源与当前统计
 
-基于当前工作区的实际盘点：
+以下统计基于当前工作区目录盘点，以及 `python scripts/smoke_test.py --full-depth-scan` 在 `2026-04-24` 的实测结果：
 
 - UA-DETRAC 训练序列：`60`
 - UA-DETRAC 训练图像：`83,791`
@@ -189,16 +209,17 @@ D:\BS
 按当前默认 `FRAME_STRIDE = 1` 和序列级 `80/20` 划分：
 
 - 训练序列：`48`
-- 训练样本：`66,241`
+- 训练样本：`67,790`
 - 验证序列：`12`
-- 验证样本：`17,550`
+- 验证样本：`16,001`
 
 当前深度缓存覆盖情况：
 
-- `outputs/Depth_Cache/` 中已有 `66,241` 个 `.npy` 文件
-- 在默认训练划分下，这已经覆盖当前训练集样本数
+- `outputs/Depth_Cache/` 中当前共有 `83,791` 个 `.npy` 文件
+- 在默认 `FRAME_STRIDE = 1` 的 train/val 划分下，`67,790 + 16,001 = 83,791`
+- `smoke_test --full-depth-scan` 已确认 train 和 val 两侧都没有缺失深度缓存
 
-需要注意的是，`README` 不再默认宣称存在离线雾图、离线 YOLO 数据集、ONNX 或 checkpoint，因为这些产物在当前工作区里并不存在，且本身也不纳入版本控制。
+需要注意的是，虽然当前工作区里已经存在权重、checkpoint 和 ONNX，但这些都属于本地运行产物，仍然不应被当作 Git 仓库本身默认携带的固定内容。
 
 ## 配置体系
 
@@ -228,9 +249,16 @@ D:\BS
 - `NUM_FOG_CLASSES = 3`
 - `IMG_SIZE = 512`
 - `FRAME_STRIDE`
+- `TRAIN_RATIO = 0.8`
 - `PRECOMPUTE_DEPTH_CACHE`
 - `BASE_CONF_THRES = 0.25`
-- `EMA_ALPHA = 0.1`
+- `EMA_ALPHA = 0.05`
+- `DET_LOSS_WEIGHT = 1.0`
+- `FOG_CLS_LOSS_WEIGHT = 1.5`
+- `FOG_REG_LOSS_WEIGHT = 1.25`
+- `FOG_CLEAR_PROB = 0.15`
+- `FOG_UNIFORM_PROB = 0.35`
+- `FOG_PATCHY_PROB = 0.50`
 - `USE_IMAGENET_NORMALIZE = False`
 
 ## 环境与依赖
@@ -260,6 +288,7 @@ D:\BS
 - `requirements.txt` 现提供核心运行依赖，`requirements-dev.txt` 现提供开发工具依赖
 - `tensorrt` 仍因平台差异未纳入默认 pip 清单
 - `MiDaS` 通过 `torch.hub` 加载，首次运行可能依赖联网或本地缓存
+- 当前工作区根目录已经包含 `yolo11n.pt`，因此默认模型初始化通常不需要再下载基础检测权重
 - `src/__init__.py`、`src.data` 和 `src.model` 现在采用懒加载导出，避免仅导入配置模块时就被 `ultralytics` 等重依赖阻断
 
 ## 常用命令
@@ -392,6 +421,8 @@ python scripts/generate_line_by_line_docs.py
   覆盖默认设备选择，例如 `cpu` 或 `cuda`
 - `BS_FRAME_STRIDE`
   控制帧抽样步长，默认 `1`
+- `BS_TRAIN_RATIO`
+  覆盖序列级训练集划分比例，默认 `0.8`
 - `BS_BATCH_SIZE`
   覆盖训练 batch size
 - `BS_EPOCHS`
@@ -424,6 +455,8 @@ python scripts/generate_line_by_line_docs.py
   非有限梯度 batch 占比达到该阈值时直接中止训练
 - `BS_NONFINITE_GRAD_FAIL_STREAK`
   只有连续多少个 epoch 都超过 `BS_NONFINITE_GRAD_FAIL_RATIO` 时，才真正中止训练
+- `BS_NONFINITE_GRAD_AUTO_DISABLE_AMP`
+  为 `1/true/yes/on` 时，在满足 fail 条件后优先触发“自动关闭 AMP 并继续训练”的恢复路径
 - `BS_SEED`
   覆盖训练随机种子
 - `BS_NUM_WORKERS`
@@ -436,6 +469,42 @@ python scripts/generate_line_by_line_docs.py
   覆盖 checkpoint 保存间隔
 - `BS_CHECKPOINT_KEEP_MAX`
   覆盖 checkpoint 历史保留数量
+- `BS_FOG_CLEAR_PROB`
+  覆盖在线造雾时 `clear` 类样本采样概率
+- `BS_FOG_UNIFORM_PROB`
+  覆盖 `uniform fog` 样本采样概率
+- `BS_FOG_PATCHY_PROB`
+  覆盖 `patchy fog` 样本采样概率
+- `BS_FOG_BETA_MIN`
+  覆盖在线造雾使用的最小 beta
+- `BS_UNIFORM_DEPTH_SCALE`
+  覆盖均匀雾模式的有效深度缩放系数
+- `BS_PATCHY_DEPTH_BASE`
+  覆盖团雾模式的基础深度项
+- `BS_PATCHY_DEPTH_NOISE_SCALE`
+  覆盖团雾模式的噪声深度放大系数
+- `BS_DET_LOSS_WEIGHT`
+  覆盖检测损失权重
+- `BS_FOG_CLS_LOSS_WEIGHT`
+  覆盖雾分类损失权重
+- `BS_FOG_REG_LOSS_WEIGHT`
+  覆盖 beta 回归损失权重
+- `BS_FOG_LABEL_SMOOTHING`
+  覆盖雾分类标签平滑系数
+- `BS_FOG_CLS_CLEAR_WEIGHT`
+  覆盖 `clear` 类分类损失权重
+- `BS_FOG_CLS_UNIFORM_WEIGHT`
+  覆盖 `uniform` 类分类损失权重
+- `BS_FOG_CLS_PATCHY_WEIGHT`
+  覆盖 `patchy` 类分类损失权重
+- `BS_EMA_ALPHA`
+  覆盖推理阶段 beta EMA 平滑系数
+- `BS_RESUME_CHECKPOINT`
+  显式指定要恢复的 checkpoint 路径
+- `BS_RESUME_MODEL_ONLY`
+  为 `1/true/yes/on` 时只恢复模型参数，不恢复优化器/调度器/scaler 状态
+- `BS_FREEZE_YOLO_FOR_FOG`
+  为 `1/true/yes/on` 时冻结 YOLO 检测参数，仅做雾头适配式训练
 - `BS_CUDNN_DETERMINISTIC`
   控制 CuDNN 是否走确定性模式
 - `BS_CUDNN_BENCHMARK`
@@ -445,10 +514,10 @@ python scripts/generate_line_by_line_docs.py
 
 当前最需要实事求是说明的限制包括：
 
-- 当前工作区未附带训练好的正式权重文件
-- 若 `yolo11n.pt` 不在本地，首次模型初始化可能触发 Ultralytics 自动下载基础权重
-- 若 `outputs/Fog_Detection_Project/` 下没有训练权重，推理脚本会退回随机初始化权重
-- 由于 `outputs/` 被忽略，README 不能把“某个权重/某个 ONNX 已存在”写成固定事实
+- 默认输出目录下虽然已有 `unified_model*.pt`、checkpoint 和 `outputs/unified_multitask.onnx`，但从现有 `runs/smoke_*` 记录看，至少其中一批产物来源于 smoke run / 小规模验证，不应直接等同于正式最终模型
+- 当前工作区尚未发现 TensorRT `engine`、QAT INT8 权重等最终部署产物
+- 当前 `outputs/` 下存在多组历史实验目录，但这些目录并不等于当前 `src/config.py` 默认输出路径
+- 如果把本仓库迁移到新环境，`outputs/` 下的权重和 ONNX 依然不能被假定为必然存在，因为这些文件不随 Git 固定分发
 - 当前仅补齐了 pip 依赖清单，尚未提供包含系统库、CUDA 和 conda 元数据的完整锁定环境文件
 - 最终论文所需的系统性量化实验结果仍需要单独整理
 
@@ -464,6 +533,10 @@ python scripts/generate_line_by_line_docs.py
 - [src/inference.py](./src/inference.py)：推理入口
 - [src/export.py](./src/export.py)：导出入口
 - [src/utils.py](./src/utils.py)：权重解析、checkpoint 选择、letterbox 工具
+- [scripts/smoke_test.py](./scripts/smoke_test.py)：训练前自检
+- [scripts/check_dataset.py](./scripts/check_dataset.py)：数据审计与样例可视化
+- [scripts/hybrid_fog_vehicle_infer.py](./scripts/hybrid_fog_vehicle_infer.py)：混合推理演示
+- [scripts/adapt_fog_to_video.py](./scripts/adapt_fog_to_video.py)：面向目标视频的雾头适配
 
 ## 总结
 

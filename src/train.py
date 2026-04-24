@@ -93,6 +93,20 @@ def build_cfg_snapshot(cfg: Config) -> dict:
         "beta_max": cfg.BETA_MAX,
         "a_min": cfg.A_MIN,
         "a_max": cfg.A_MAX,
+        "fog_clear_prob": cfg.FOG_CLEAR_PROB,
+        "fog_uniform_prob": cfg.FOG_UNIFORM_PROB,
+        "fog_patchy_prob": cfg.FOG_PATCHY_PROB,
+        "fog_beta_min": cfg.FOG_BETA_MIN,
+        "uniform_depth_scale": cfg.UNIFORM_DEPTH_SCALE,
+        "patchy_depth_base": cfg.PATCHY_DEPTH_BASE,
+        "patchy_depth_noise_scale": cfg.PATCHY_DEPTH_NOISE_SCALE,
+        "fog_label_smoothing": cfg.FOG_LABEL_SMOOTHING,
+        "fog_cls_clear_weight": cfg.FOG_CLS_CLEAR_WEIGHT,
+        "fog_cls_uniform_weight": cfg.FOG_CLS_UNIFORM_WEIGHT,
+        "fog_cls_patchy_weight": cfg.FOG_CLS_PATCHY_WEIGHT,
+        "resume_checkpoint": cfg.RESUME_CHECKPOINT,
+        "resume_model_only": cfg.RESUME_MODEL_ONLY,
+        "freeze_yolo_for_fog": cfg.FREEZE_YOLO_FOR_FOG,
     }
 
 
@@ -629,9 +643,21 @@ def build_train_components(cfg: Config, device: str):
         val_loader_kwargs["shuffle"] = False
         val_loader = DataLoader(val_ds, **val_loader_kwargs)
 
-    # 当前雾分类使用标准交叉熵，beta 回归使用均方误差。
-    criterion_cls = nn.CrossEntropyLoss()
-    criterion_reg = nn.MSELoss()
+    cls_weight = torch.tensor(
+        [
+            cfg.FOG_CLS_CLEAR_WEIGHT,
+            cfg.FOG_CLS_UNIFORM_WEIGHT,
+            cfg.FOG_CLS_PATCHY_WEIGHT,
+        ],
+        dtype=torch.float32,
+    )
+    # 给 clear 更低的损失权重，并加少量 label smoothing，
+    # 以降低天气头在真实视频上“高置信度塌到 clear”的风险。
+    criterion_cls = nn.CrossEntropyLoss(
+        weight=cls_weight,
+        label_smoothing=cfg.FOG_LABEL_SMOOTHING,
+    ).to(device)
+    criterion_reg = nn.MSELoss().to(device)
     return normalize, train_loader, val_loader, criterion_cls, criterion_reg
 
 
@@ -659,8 +685,11 @@ def compute_multitask_losses(
         "bboxes": det_targets["bboxes"].to(device),
     }
 
-    det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
-    loss_det = det_loss_components.sum() / max(imgs_norm.size(0), 1)
+    if cfg.DET_LOSS_WEIGHT > 0:
+        det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
+        loss_det = det_loss_components.sum() / max(imgs_norm.size(0), 1)
+    else:
+        loss_det = pred_cls.new_zeros(())
     loss_cls = criterion_cls(pred_cls, cls_labels)
     loss_reg = criterion_reg(pred_reg * cfg.BETA_MAX, reg_labels)
     loss = (
@@ -711,6 +740,10 @@ def train_epoch(
     5. 按权重求和后反向传播。
     """
     model.train()
+    if cfg.FREEZE_YOLO_FOR_FOG:
+        # Freeze detector BN/dropout behavior as well; this mode is intended for
+        # short weather-head-focused adaptation rather than detector optimization.
+        model.yolo.eval()
     meter = init_epoch_meter()
     pbar = tqdm(train_loader, desc=desc)
     warned_nonfinite_amp_grad = False
@@ -959,6 +992,11 @@ def train():
     ).to(device)
     fog_augmenter = FogAugmentation(cfg).to(device)
 
+    if cfg.FREEZE_YOLO_FOR_FOG:
+        for parameter in model.yolo.parameters():
+            parameter.requires_grad = False
+        print("YOLO detector parameters are frozen for fog-focused fine-tuning.")
+
     os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
 
@@ -966,7 +1004,10 @@ def train():
         build_train_components(cfg, device)
     )
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.LR)
+    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_parameters:
+        raise RuntimeError("No trainable parameters remain after applying freeze settings.")
+    optimizer = optim.AdamW(trainable_parameters, lr=cfg.LR)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
     amp_enabled = device == "cuda" and not cfg.DISABLE_AMP
     scaler = torch.amp.GradScaler("cuda") if amp_enabled else None
@@ -975,20 +1016,31 @@ def train():
     elif device == "cuda":
         print("AMP is disabled.")
 
-    latest_checkpoint = find_latest_checkpoint(cfg.CHECKPOINT_DIR)
+    latest_checkpoint = (
+        cfg.RESUME_CHECKPOINT
+        if cfg.RESUME_CHECKPOINT
+        else find_latest_checkpoint(cfg.CHECKPOINT_DIR)
+    )
     start_epoch = 0
     best_loss = float("inf")
     best_model_path = os.path.join(cfg.OUTPUT_DIR, "unified_model_best.pt")
 
     # 若发现已有 checkpoint，则优先续训，避免重复浪费训练时间。
     if latest_checkpoint:
+        print(f"Resume checkpoint: {latest_checkpoint}")
         try:
+            if cfg.FREEZE_YOLO_FOR_FOG and not cfg.RESUME_MODEL_ONLY:
+                print(
+                    "FREEZE_YOLO_FOR_FOG is enabled, so optimizer/scheduler state "
+                    "recovery is skipped automatically to avoid mismatched param groups."
+                )
+            resume_model_only = cfg.RESUME_MODEL_ONLY or cfg.FREEZE_YOLO_FOR_FOG
             start_epoch, _, best_loss = load_checkpoint(
                 latest_checkpoint,
                 model,
-                optimizer,
-                scheduler,
-                scaler,
+                None if resume_model_only else optimizer,
+                None if resume_model_only else scheduler,
+                None if resume_model_only else scaler,
             )
         except Exception as exc:
             print(

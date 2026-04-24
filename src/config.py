@@ -201,6 +201,30 @@ class Config:
     BETA_MAX = 0.1
     A_MIN = 0.7
     A_MAX = 0.95
+    # 真实雾视频验证表明，过多 clear 样本和过轻的雾增强会让天气头更容易
+    # 向 `clear` 方向过度自信。下面这些参数用于把在线造雾做得更“偏雾天”。
+    FOG_CLEAR_PROB = min(
+        1.0, max(0.0, float(os.getenv("BS_FOG_CLEAR_PROB", "0.15")))
+    )
+    FOG_UNIFORM_PROB = min(
+        1.0, max(0.0, float(os.getenv("BS_FOG_UNIFORM_PROB", "0.35")))
+    )
+    FOG_PATCHY_PROB = min(
+        1.0, max(0.0, float(os.getenv("BS_FOG_PATCHY_PROB", "0.50")))
+    )
+    FOG_BETA_MIN = min(
+        BETA_MAX,
+        max(BETA_MIN, float(os.getenv("BS_FOG_BETA_MIN", "0.04"))),
+    )
+    UNIFORM_DEPTH_SCALE = max(
+        1.0, float(os.getenv("BS_UNIFORM_DEPTH_SCALE", "7.0"))
+    )
+    PATCHY_DEPTH_BASE = max(
+        0.0, float(os.getenv("BS_PATCHY_DEPTH_BASE", "2.0"))
+    )
+    PATCHY_DEPTH_NOISE_SCALE = max(
+        0.0, float(os.getenv("BS_PATCHY_DEPTH_NOISE_SCALE", "8.0"))
+    )
 
     # ==================== 设备配置 ====================
     # 在导入配置时就根据当前环境探测默认设备。
@@ -209,7 +233,7 @@ class Config:
 
     # ==================== 推理配置 ====================
     BASE_CONF_THRES = 0.25
-    EMA_ALPHA = 0.1
+    EMA_ALPHA = float(os.getenv("BS_EMA_ALPHA", "0.05"))
 
     # 是否对输入应用 ImageNet 均值方差归一化。
     # 当前默认关闭，意味着训练和推理都主要使用 `[0, 1]` 范围的原始张量。
@@ -219,9 +243,34 @@ class Config:
     # ==================== 多任务损失权重 ====================
     # 当前三项任务默认等权。
     # 若后续发现检测、分类或回归的尺度差异较大，可以从这里统一调整。
-    DET_LOSS_WEIGHT = 1.0
-    FOG_CLS_LOSS_WEIGHT = 1.0
-    FOG_REG_LOSS_WEIGHT = 1.0
+    DET_LOSS_WEIGHT = float(os.getenv("BS_DET_LOSS_WEIGHT", "1.0"))
+    FOG_CLS_LOSS_WEIGHT = float(os.getenv("BS_FOG_CLS_LOSS_WEIGHT", "1.5"))
+    FOG_REG_LOSS_WEIGHT = float(os.getenv("BS_FOG_REG_LOSS_WEIGHT", "1.25"))
+    FOG_LABEL_SMOOTHING = min(
+        0.3, max(0.0, float(os.getenv("BS_FOG_LABEL_SMOOTHING", "0.05")))
+    )
+    FOG_CLS_CLEAR_WEIGHT = max(
+        0.1, float(os.getenv("BS_FOG_CLS_CLEAR_WEIGHT", "0.75"))
+    )
+    FOG_CLS_UNIFORM_WEIGHT = max(
+        0.1, float(os.getenv("BS_FOG_CLS_UNIFORM_WEIGHT", "1.0"))
+    )
+    FOG_CLS_PATCHY_WEIGHT = max(
+        0.1, float(os.getenv("BS_FOG_CLS_PATCHY_WEIGHT", "1.1"))
+    )
+    RESUME_CHECKPOINT = os.getenv("BS_RESUME_CHECKPOINT")
+    RESUME_MODEL_ONLY = os.getenv("BS_RESUME_MODEL_ONLY", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    FREEZE_YOLO_FOR_FOG = os.getenv("BS_FREEZE_YOLO_FOR_FOG", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     def __init__(self):
         """
@@ -276,6 +325,21 @@ class Config:
             "nonfinite_grad_auto_disable_amp": self.NONFINITE_GRAD_AUTO_DISABLE_AMP,
             "skip_qat": self.SKIP_QAT,
             "disable_amp": self.DISABLE_AMP,
+            "fog_clear_prob": self.FOG_CLEAR_PROB,
+            "fog_uniform_prob": self.FOG_UNIFORM_PROB,
+            "fog_patchy_prob": self.FOG_PATCHY_PROB,
+            "fog_beta_min": self.FOG_BETA_MIN,
+            "uniform_depth_scale": self.UNIFORM_DEPTH_SCALE,
+            "patchy_depth_base": self.PATCHY_DEPTH_BASE,
+            "patchy_depth_noise_scale": self.PATCHY_DEPTH_NOISE_SCALE,
+            "fog_label_smoothing": self.FOG_LABEL_SMOOTHING,
+            "fog_cls_clear_weight": self.FOG_CLS_CLEAR_WEIGHT,
+            "fog_cls_uniform_weight": self.FOG_CLS_UNIFORM_WEIGHT,
+            "fog_cls_patchy_weight": self.FOG_CLS_PATCHY_WEIGHT,
+            "det_loss_weight": self.DET_LOSS_WEIGHT,
+            "fog_reg_loss_weight": self.FOG_REG_LOSS_WEIGHT,
+            "resume_model_only": self.RESUME_MODEL_ONLY,
+            "freeze_yolo_for_fog": self.FREEZE_YOLO_FOR_FOG,
             "seed": self.SEED,
         }
 
