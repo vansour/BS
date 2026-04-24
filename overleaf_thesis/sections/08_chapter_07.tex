@@ -1,0 +1,70 @@
+\chapter{视频推理系统设计、可视化与部署实现}
+
+\section{统一模型推理流程}
+
+统一模型推理由 \code{src/inference.py} 中的 \code{HighwayFogSystem} 封装完成。系统首先根据配置自动解析模型权重路径，优先选择 \code{unified_model_best.pt}；若不存在，则回退至 \code{unified_model.pt} 或最新 checkpoint。随后，系统对视频帧执行如下流程：
+
+\begin{enumerate}[leftmargin=2.5em]
+\item 读取 OpenCV BGR 帧并转换为 RGB；
+\item 按训练阶段一致的规则执行 letterbox 预处理；
+\item 输入统一多任务模型，得到检测输出、雾分类 logits 和 beta 回归值；
+\item 对检测结果执行 NMS；
+\item 对 beta 进行 EMA 平滑；
+\item 根据平滑后的 beta 计算自适应置信度阈值；
+\item 绘制车辆检测框、雾状态和 beta 信息。
+\end{enumerate}
+
+这种推理链保留了训练-推理一致性，也使雾估计不再只是附加文本输出，而是直接参与检测显示策略控制。
+
+\section{动态阈值机制}
+
+在低能见度场景下，固定检测阈值容易造成漏检。若仍使用与晴天相同的较高阈值，模型可能在轻度或中度雾中丢失一些本就较弱的车辆响应。为此，本文在推理阶段设置基础阈值 \code{BASE_CONF_THRES = 0.25}，再根据平滑后的 beta 值进行动态调整。当前代码中的核心思想可以概括为：
+
+\[
+conf_{adaptive} = \max(conf_{min}, conf_{base} - k\hat{\beta})
+\]
+
+其中 \texttt{conf\_min = 0.15}，\texttt{k = 1.2}。这意味着当雾浓度上升时，系统会适当降低显示阈值，保留更多潜在目标。虽然这种策略还不是严格意义上的风险最优控制，但它体现了一种重要思想：天气感知结果应当反馈到目标检测显示策略，而不是与检测分离。
+
+\section{运行时多流与异步组织}
+
+若运行设备为 CUDA，\texttt{HighwayFogSystem} 会创建预处理流、推理流和后处理流，尽量让不同阶段形成轻量级流水线。虽然在当前项目规模下，多流并不能使每一步都完全并行，但它有助于降低 CPU/GPU 空转等待，使视频演示更加流畅。该设计说明本文在实现中不仅考虑了算法正确性，也兼顾了运行效率与展示效果。
+
+\section{混合推理方案}
+
+在本文工程推进过程中发现：当前统一模型早期训练权重已经能够给出合理的雾分类概率和 beta 数值，但对真实下载雾视频中的车辆检测效果不如原始预训练 \texttt{yolo11n.pt} 稳定。考虑到毕业设计需要尽快形成“车辆 + 雾状态 + 雾浓度”同时可视化的结果，本文进一步实现了位于 \texttt{scripts/hybrid\_fog\_vehicle\_infer.py} 的混合推理脚本。
+
+该脚本采用如下策略：
+
+\begin{itemize}[leftmargin=2em]
+\item 用 \texttt{yolo11n.pt} 负责真实视频中的车辆检测；
+\item 用统一多任务模型负责雾分类和 beta 估计；
+\item 将两者结果在同一视频中叠加显示；
+\item 在右下角构建“雾浓度分布图”小地图，用于增强对空间非均匀雾的直观解释。
+\end{itemize}
+
+从严格学术角度看，混合推理不等于统一模型最终目标；但从工程验证角度看，它很好地解决了“系统需要立刻可用，而统一模型尚在持续优化中”的现实问题。其意义在于保证整个毕业设计在方法研究与系统演示之间形成平衡。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.94\textwidth]{fig_08_inference_visualization.png}
+  \caption{推理结果可视化图}
+  \label{fig:inference_visualization}
+\end{figure}
+
+\section{雾浓度分布图的构建思路}
+
+需要指出的是，当前统一模型输出的是整帧一个 beta 值，而不是逐像素的雾浓度图。因此，右下角的小地图并不是模型直接回归得到的“真值级空间雾图”，而是一种基于图像局部对比度、饱和度和亮度白化程度估算得到的相对空间雾浓度分布图，并使用全局 beta 对其进行强度校正。
+
+这一设计虽然不是严格物理反演，但具备三个优点：第一，能够在演示视频中直观体现“同一画面不同位置雾强度可能不同”；第二，结合全局 beta 可获得相对稳定的整体浓淡变化；第三，工程实现简单，不需要额外训练密集预测网络。对于论文初稿和系统展示阶段，这种设计已经具有较强的解释性。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.65\textwidth]{fig_09_fog_map_example.png}
+  \caption{混合推理右下角雾浓度分布图示例}
+  \label{fig:fog_map_example}
+\end{figure}
+
+\section{导出与部署路径}
+
+为了使本文方法具备更明确的工程延展性，项目还实现了 \texttt{src/export.py} 导出脚本。该脚本可将统一模型导出为 ONNX，并给出 TensorRT INT8 引擎构建示例和 Jetson 部署提示。训练脚本中则保留了 QAT 和 INT8 转换路径。虽然本文目前仍以桌面 GPU 环境下的模型训练和视频推理为主，但从代码结构上看，后续迁移到边缘设备、收费站终端或路侧计算节点具备可操作基础。
