@@ -60,6 +60,19 @@ data/Insight-MVT_Annotation_*/
 *.log
 tensorboard/
 
+# LaTeX / Overleaf build intermediates
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.toc
+*.xdv
+*.synctex.gz
+*.lof
+*.lot
+*.bcf
+*.run.xml
+
 # Temporary files
 temp/
 tmp/
