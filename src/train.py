@@ -20,6 +20,7 @@ Unified Multi-Task Training Script
 断点续训机制、QAT 量化训练以及最终 INT8 转换前的必要步骤。
 """
 
+import argparse
 import json
 import math
 import multiprocessing
@@ -40,7 +41,18 @@ if project_root not in sys.path:
 from src.config import Config
 from src.data import MultiTaskDataset, precompute_depths
 from src.model import FogAugmentation, UnifiedMultiTaskModel
-from src.utils import find_latest_checkpoint, set_seed
+from src.utils import find_latest_checkpoint, load_model_weights, set_seed
+
+
+def parse_args() -> argparse.Namespace:
+    """解析训练脚本命令行参数。"""
+    parser = argparse.ArgumentParser(description="Unified multi-task training entrypoint.")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="可选配置文件路径（.json/.yaml/.yml）。未提供时仍沿用默认配置和环境变量。",
+    )
+    return parser.parse_args()
 
 
 def build_cfg_snapshot(cfg: Config) -> dict:
@@ -59,12 +71,16 @@ def build_cfg_snapshot(cfg: Config) -> dict:
     - 即使配置类后续发生变化，也能保留当时训练时的主要超参数摘要。
     """
     return {
+        "config_file": cfg.CONFIG_FILE,
         "yolo_base_model": cfg.YOLO_BASE_MODEL,
+        "det_head_mode": cfg.DET_HEAD_MODE,
         "num_det_classes": cfg.NUM_DET_CLASSES,
         "det_train_class_id": cfg.DET_TRAIN_CLASS_ID,
         "vehicle_class_ids": list(cfg.VEHICLE_CLASS_IDS),
+        "coco_vehicle_train_class_id": cfg.COCO_VEHICLE_TRAIN_CLASS_ID,
         "num_fog_classes": cfg.NUM_FOG_CLASSES,
         "det_loss_weight": cfg.DET_LOSS_WEIGHT,
+        "clear_det_loss_weight": cfg.CLEAR_DET_LOSS_WEIGHT,
         "fog_cls_loss_weight": cfg.FOG_CLS_LOSS_WEIGHT,
         "fog_reg_loss_weight": cfg.FOG_REG_LOSS_WEIGHT,
         "batch_size": cfg.BATCH_SIZE,
@@ -106,6 +122,8 @@ def build_cfg_snapshot(cfg: Config) -> dict:
         "fog_cls_patchy_weight": cfg.FOG_CLS_PATCHY_WEIGHT,
         "resume_checkpoint": cfg.RESUME_CHECKPOINT,
         "resume_model_only": cfg.RESUME_MODEL_ONLY,
+        "resume_nonstrict_model_only": cfg.RESUME_NONSTRICT_MODEL_ONLY,
+        "resume_reset_epoch": cfg.RESUME_RESET_EPOCH,
         "freeze_yolo_for_fog": cfg.FREEZE_YOLO_FOR_FOG,
     }
 
@@ -159,6 +177,7 @@ def init_epoch_meter() -> dict[str, float]:
     return {
         "loss": 0.0,
         "det": 0.0,
+        "clear_det": 0.0,
         "fog_cls": 0.0,
         "fog_reg": 0.0,
         "grad_norm": 0.0,
@@ -176,6 +195,7 @@ def finalize_epoch_meter(meter: dict[str, float]) -> dict[str, float]:
     result = {
         "loss": meter["loss"] / batches,
         "det": meter["det"] / batches,
+        "clear_det": meter["clear_det"] / batches,
         "fog_cls": meter["fog_cls"] / batches,
         "fog_reg": meter["fog_reg"] / batches,
         "batches": batches,
@@ -484,6 +504,57 @@ def load_checkpoint(
     return start_epoch, train_loss, best_loss
 
 
+def load_checkpoint_model_only(
+    checkpoint_path: str,
+    model,
+    *,
+    map_location: str = "cpu",
+    reset_epoch: bool = False,
+) -> tuple[int, float, dict]:
+    """
+    只恢复模型参数，并允许非严格跳过 shape 不匹配项。
+
+    该路径主要服务于“检测头结构发生变化，但仍希望复用 backbone / fog heads”
+    这类结构迁移实验。
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    report = load_model_weights(model, checkpoint_path, map_location=map_location)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint_epoch = (
+        int(payload.get("epoch", -1))
+        if isinstance(payload, dict)
+        else -1
+    )
+    best_loss = (
+        float(payload.get("best_loss", float("inf")))
+        if isinstance(payload, dict)
+        else float("inf")
+    )
+    start_epoch = 0 if reset_epoch else checkpoint_epoch + 1
+    if reset_epoch:
+        best_loss = float("inf")
+
+    print(f"Loaded model-only weights from: {checkpoint_path}")
+    print(f"Model-only load source: {report['source_type']}")
+    if report["missing_keys"] or report["unexpected_keys"]:
+        print(
+            f"Model-only non-strict load summary: missing={len(report['missing_keys'])}, "
+            f"unexpected={len(report['unexpected_keys'])}"
+        )
+    if report.get("skipped_mismatched_keys"):
+        print(
+            "Model-only skipped mismatched keys: "
+            f"{len(report['skipped_mismatched_keys'])}"
+        )
+    if reset_epoch:
+        print("Model-only resume is configured to reset epoch/best_loss state.")
+    else:
+        print(f"Model-only resume will continue from epoch {start_epoch}.")
+    return start_epoch, best_loss, report
+
+
 def summarize_missing_depth_cache(dataset: MultiTaskDataset) -> tuple[int, list[str]]:
     """
     统计数据集中缺失的深度缓存数量，并返回少量样例文件名。
@@ -661,9 +732,28 @@ def build_train_components(cfg: Config, device: str):
     return normalize, train_loader, val_loader, criterion_cls, criterion_reg
 
 
-def compute_multitask_losses(
+def compute_detection_loss_from_preds(
     model,
     imgs_norm,
+    det_targets,
+    det_preds,
+    device,
+):
+    """根据已得到的原始检测预测结构计算检测损失。"""
+    det_batch = {
+        "img": imgs_norm,
+        "batch_idx": det_targets["batch_idx"].to(device),
+        "cls": det_targets["cls"].to(device),
+        "bboxes": det_targets["bboxes"].to(device),
+    }
+    det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
+    return det_loss_components.sum() / max(imgs_norm.size(0), 1)
+
+
+def compute_multitask_losses(
+    model,
+    imgs_foggy_norm,
+    imgs_clear_norm,
     det_targets,
     cls_labels,
     reg_labels,
@@ -677,27 +767,38 @@ def compute_multitask_losses(
     """
     # 验证阶段模型处于 eval()，但 detection loss 仍需要训练态那类原始检测输出结构。
     # 因此这里显式要求模型返回 raw detection preds，而不是推理用的后处理张量。
-    det_preds, pred_cls, pred_reg = model(imgs_norm, return_raw_det=True)
-    det_batch = {
-        "img": imgs_norm,
-        "batch_idx": det_targets["batch_idx"].to(device),
-        "cls": det_targets["cls"].to(device),
-        "bboxes": det_targets["bboxes"].to(device),
-    }
+    det_preds, pred_cls, pred_reg = model(imgs_foggy_norm, return_raw_det=True)
 
     if cfg.DET_LOSS_WEIGHT > 0:
-        det_loss_components, _ = model.yolo.loss(det_batch, preds=det_preds)
-        loss_det = det_loss_components.sum() / max(imgs_norm.size(0), 1)
+        loss_det = compute_detection_loss_from_preds(
+            model,
+            imgs_foggy_norm,
+            det_targets,
+            det_preds,
+            device,
+        )
     else:
         loss_det = pred_cls.new_zeros(())
+    if cfg.CLEAR_DET_LOSS_WEIGHT > 0:
+        clear_det_preds, _, _ = model(imgs_clear_norm, return_raw_det=True)
+        loss_det_clear = compute_detection_loss_from_preds(
+            model,
+            imgs_clear_norm,
+            det_targets,
+            clear_det_preds,
+            device,
+        )
+    else:
+        loss_det_clear = pred_cls.new_zeros(())
     loss_cls = criterion_cls(pred_cls, cls_labels)
     loss_reg = criterion_reg(pred_reg * cfg.BETA_MAX, reg_labels)
     loss = (
         cfg.DET_LOSS_WEIGHT * loss_det
+        + cfg.CLEAR_DET_LOSS_WEIGHT * loss_det_clear
         + cfg.FOG_CLS_LOSS_WEIGHT * loss_cls
         + cfg.FOG_REG_LOSS_WEIGHT * loss_reg
     )
-    return loss, loss_det, loss_cls, loss_reg
+    return loss, loss_det, loss_det_clear, loss_cls, loss_reg
 
 
 def train_epoch(
@@ -760,6 +861,7 @@ def train_epoch(
         with torch.no_grad():
             imgs_foggy, cls_labels, reg_labels = fog_augmenter(imgs, depths)
             imgs_norm = normalize(imgs_foggy)
+            imgs_clear_norm = normalize(imgs)
 
         optimizer.zero_grad(set_to_none=True)
         grad_norm_value = 0.0
@@ -767,9 +869,10 @@ def train_epoch(
         # 在 CUDA 环境下优先启用 AMP，以降低显存压力并提升吞吐。
         if scaler is not None:
             with torch.amp.autocast("cuda"):
-                loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                loss, loss_det, loss_det_clear, loss_cls, loss_reg = compute_multitask_losses(
                     model,
                     imgs_norm,
+                    imgs_clear_norm,
                     det_targets,
                     cls_labels,
                     reg_labels,
@@ -780,6 +883,7 @@ def train_epoch(
                 )
             loss_value = finite_scalar("loss", loss)
             det_value = finite_scalar("det_loss", loss_det)
+            clear_det_value = finite_scalar("clear_det_loss", loss_det_clear)
             cls_value = finite_scalar("fog_cls_loss", loss_cls)
             reg_value = finite_scalar("fog_reg_loss", loss_reg)
             scaler.scale(loss).backward()
@@ -801,9 +905,10 @@ def train_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+            loss, loss_det, loss_det_clear, loss_cls, loss_reg = compute_multitask_losses(
                 model,
                 imgs_norm,
+                imgs_clear_norm,
                 det_targets,
                 cls_labels,
                 reg_labels,
@@ -814,6 +919,7 @@ def train_epoch(
             )
             loss_value = finite_scalar("loss", loss)
             det_value = finite_scalar("det_loss", loss_det)
+            clear_det_value = finite_scalar("clear_det_loss", loss_det_clear)
             cls_value = finite_scalar("fog_cls_loss", loss_cls)
             reg_value = finite_scalar("fog_reg_loss", loss_reg)
             loss.backward()
@@ -827,6 +933,7 @@ def train_epoch(
 
         meter["loss"] += loss_value
         meter["det"] += det_value
+        meter["clear_det"] += clear_det_value
         meter["fog_cls"] += cls_value
         meter["fog_reg"] += reg_value
         meter["grad_norm"] += grad_norm_value
@@ -835,6 +942,7 @@ def train_epoch(
         postfix = {
             "loss": f"{loss_value:.4f}",
             "det": f"{det_value:.4f}",
+            "clear_det": f"{clear_det_value:.4f}",
             "fog_cls": f"{cls_value:.4f}",
             "fog_reg": f"{reg_value:.4f}",
         }
@@ -891,12 +999,14 @@ def validate_epoch(
 
                 imgs_foggy, cls_labels, reg_labels = fog_augmenter(imgs, depths)
                 imgs_norm = normalize(imgs_foggy)
+                imgs_clear_norm = normalize(imgs)
 
                 if device == "cuda" and amp_enabled:
                     with torch.amp.autocast("cuda"):
-                        loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                        loss, loss_det, loss_det_clear, loss_cls, loss_reg = compute_multitask_losses(
                             model,
                             imgs_norm,
+                            imgs_clear_norm,
                             det_targets,
                             cls_labels,
                             reg_labels,
@@ -906,9 +1016,10 @@ def validate_epoch(
                             device,
                         )
                 else:
-                    loss, loss_det, loss_cls, loss_reg = compute_multitask_losses(
+                    loss, loss_det, loss_det_clear, loss_cls, loss_reg = compute_multitask_losses(
                         model,
                         imgs_norm,
+                        imgs_clear_norm,
                         det_targets,
                         cls_labels,
                         reg_labels,
@@ -920,11 +1031,13 @@ def validate_epoch(
 
                 loss_value = finite_scalar("val_loss", loss)
                 det_value = finite_scalar("val_det_loss", loss_det)
+                clear_det_value = finite_scalar("val_clear_det_loss", loss_det_clear)
                 cls_value = finite_scalar("val_fog_cls_loss", loss_cls)
                 reg_value = finite_scalar("val_fog_reg_loss", loss_reg)
 
                 meter["loss"] += loss_value
                 meter["det"] += det_value
+                meter["clear_det"] += clear_det_value
                 meter["fog_cls"] += cls_value
                 meter["fog_reg"] += reg_value
                 meter["batches"] += 1
@@ -932,6 +1045,7 @@ def validate_epoch(
                     {
                         "loss": f"{loss_value:.4f}",
                         "det": f"{det_value:.4f}",
+                        "clear_det": f"{clear_det_value:.4f}",
                         "fog_cls": f"{cls_value:.4f}",
                         "fog_reg": f"{reg_value:.4f}",
                     }
@@ -963,7 +1077,8 @@ def train():
     except RuntimeError:
         pass
 
-    cfg = Config()
+    args = parse_args()
+    cfg = Config(config_path=args.config)
     set_seed(cfg.SEED)
     device = cfg.DEVICE
     print(f"Using device: {device}")
@@ -989,6 +1104,7 @@ def train():
         cfg.YOLO_BASE_MODEL,
         cfg.NUM_FOG_CLASSES,
         num_det_classes=cfg.NUM_DET_CLASSES,
+        img_size=cfg.IMG_SIZE,
     ).to(device)
     fog_augmenter = FogAugmentation(cfg).to(device)
 
@@ -1035,13 +1151,21 @@ def train():
                     "recovery is skipped automatically to avoid mismatched param groups."
                 )
             resume_model_only = cfg.RESUME_MODEL_ONLY or cfg.FREEZE_YOLO_FOR_FOG
-            start_epoch, _, best_loss = load_checkpoint(
-                latest_checkpoint,
-                model,
-                None if resume_model_only else optimizer,
-                None if resume_model_only else scheduler,
-                None if resume_model_only else scaler,
-            )
+            if resume_model_only and cfg.RESUME_NONSTRICT_MODEL_ONLY:
+                start_epoch, best_loss, _ = load_checkpoint_model_only(
+                    latest_checkpoint,
+                    model,
+                    map_location="cpu",
+                    reset_epoch=cfg.RESUME_RESET_EPOCH,
+                )
+            else:
+                start_epoch, _, best_loss = load_checkpoint(
+                    latest_checkpoint,
+                    model,
+                    None if resume_model_only else optimizer,
+                    None if resume_model_only else scheduler,
+                    None if resume_model_only else scaler,
+                )
         except Exception as exc:
             print(
                 f"Checkpoint is incompatible with the current model, restarting from scratch: {exc}"

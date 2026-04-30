@@ -1,0 +1,3 @@
+# Force the XeLaTeX -> xdvipdfmx step to emit PDF 1.7 so that embedded
+# project assets such as xdulogo.pdf do not trigger a PDF-version warning.
+$xdvipdfmx = 'xdvipdfmx -V 7 %O -o %D %S';

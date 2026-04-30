@@ -1,21 +1,26 @@
-\chapter{实验设计与结果分析}
+\chapter{实验结果与分析}
+
+\section{引言}
+
+在完成系统总体设计、数据构建、模型训练以及推理部署实现之后，论文需要进一步回答两个问题：第一，当前方法在训练和验证层面取得了怎样的定量结果；第二，当前工作区中的不同权重分支、不同推理路线以及误检治理链在工程上究竟表现如何。本章将结合正式训练摘要、正式基准评估、UA-DETRAC 标准检测指标、典型误差案例和静止误检治理产物，对本文系统的实验结果进行集中分析。
 
 \section{实验目的}
 
-本文实验并非仅为了给出单一数值，而是围绕以下四个目标展开：
+本文实验并非只为了给出某一个孤立精度数值，而是围绕以下五个目标展开：
 
 \begin{enumerate}[leftmargin=2.5em]
-\item 验证“深度缓存 + 在线造雾 + 统一多任务模型”主链路能够正常运行；
-\item 验证统一模型是否能够同时输出车辆检测、雾类型分类和 beta 回归结果；
-\item 分析在线造雾与多任务学习对于固定监控视频团雾监测的适配性；
-\item 在真实下载视频上完成系统级演示验证，并评估工程可用性与后续改进方向。
+\item 验证“深度缓存 + 在线造雾 + 统一多任务模型”主链路在当前工程环境中能够稳定运行；
+\item 验证统一模型能否同时输出车辆检测、雾类型分类和 beta 回归结果，并形成可解释的视频级表现；
+\item 通过正式训练与基准评估判断当前哪一版权重最适合作为论文正式参考点；
+\item 评估统一路线与混合路线在真实雾视频和晴天对照视频片段上的差异，明确当前系统真正的短板；
+\item 验证静止假车误检治理链是否已经从“概念想法”发展为可记录、可复核、可回灌的工程闭环。
 \end{enumerate}
 
-与标准竞赛型论文不同，本文实验更加注重“方法合理性 + 工程闭环 + 可视化验证 + 后续可扩展性”。因此，实验评价体系也分为定量评价与系统验证两部分。
+因此，本文实验评价体系不再局限于单一训练损失或单个视频截图，而是同时覆盖训练曲线、离线路线评估、多模型基准评估、候选模型门槛判定结果以及静止误检治理产物。
 
 \section{实验环境}
 
-当前项目运行环境为：
+实验运行环境如下：
 
 \begin{itemize}[leftmargin=2em]
 \item Python 3.13.12
@@ -26,78 +31,162 @@
 \item GPU：NVIDIA GeForce RTX 5070 Ti Laptop GPU，显存约 12 GB
 \end{itemize}
 
-在配置方面，本文当前统一模型采用的关键参数包括：
+其中，深度学习训练与推理框架分别基于 PyTorch 与 Ultralytics 的官方实现组织\cite{pytorchDocs,ultralyticsDocs}。
+
+统一模型与推理系统的关键运行参数包括：
 
 \begin{itemize}[leftmargin=2em]
-\item 基础检测权重：\texttt{yolo11n.pt}
-\item 检测类别数：1（vehicle）
-\item 雾分类类别数：3（clear / uniform / patchy）
+\item 基础检测权重：\code{yolo11n.pt}
+\item 默认检测类别数：1（\code{vehicle}）
+\item 雾分类类别数：3（\code{clear / uniform / patchy}）
 \item 输入尺寸：512
 \item beta 范围：0.02 \textasciitilde{} 0.10
-\item 基础置信度阈值：0.25
-\item EMA 平滑系数：0.1
+\item 推理基础阈值：0.25
+\item beta 平滑与阈值联动：EMA + adaptive confidence
 \end{itemize}
 
-从工程视角看，这样的配置具有一定代表性：一方面能够在 12GB 级别显存下完成训练与推理；另一方面也为后续迁移到更轻量设备提供了参考起点。
+从工程角度看，这样的配置具有两个优点：其一，能够在 12GB 级别显存设备上完成训练、验证与视频推理；其二，QAT、ONNX 与 TensorRT 路径均已保留，后续向更轻量设备迁移时不必重写主流程。
 
-\section{数据统计与样本构成}
+\section[数据统计与 benchmark\textunderscore{}v1]{数据统计与 benchmark\textunderscore{}v1}
 
-基于当前工作区运行时统计，本文实验实际使用的数据规模如下：
+\subsection{训练数据}
+
+基于当前工作区的真实运行结果，训练与验证数据规模如表~\ref{tab:dataset_split_stats} 所示。
 
 \begin{table}[htbp]
-\centering
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-划分 & 序列数 & 样本数 & 有标注样本数 & 检测框总数 \\
-\midrule
-训练集 & 48 & 67790 & 66811 & 473719 \\
-验证集 & 12 & 16001 & 15274 & 124562 \\
-\bottomrule
-\end{tabular}
+  \centering
+  \caption{训练集与验证集规模统计}
+  \label{tab:dataset_split_stats}
+  \small
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    划分 & 序列数 & 样本数 & 有标注样本数 & 检测框总数 \\
+    \midrule
+    训练集 & 48 & 67790 & 66811 & 473719 \\
+    验证集 & 12 & 16001 & 15274 & 124562 \\
+    \bottomrule
+  \end{tabular}
 \end{table}
 
-原始数据组织和缓存情况如下：
+与此同时，当前原始训练数据目录共包含 60 个监控序列，测试目录包含 40 个序列；深度缓存文件数量已经与原始训练图像数量对齐，说明 \code{outputs/Depth_Cache} 中的 \code{.npy} 文件覆盖完整。对本文而言，这一点非常重要，因为它意味着论文中的训练结论不是建立在“少量手工挑样本”的临时环境上，而是建立在已经整理完毕的真实数据工作区上。
+
+\subsection{视频资产}
+
+为避免“不同模型用不同视频、不同采样策略比较”的混乱情况，本文冻结了一版 \code{benchmark_v1} 视频集。该视频集由 1 段真实雾视频和 4 段由 UA-DETRAC 构造的晴天对照视频片段组成\cite{uadetrac}。按照本轮正式基准评估的采样设置，其构成如表~\ref{tab:benchmark_v1_assets} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{\code{benchmark_v1} 视频集构成}
+  \label{tab:benchmark_v1_assets}
+  \small
+  \begin{tabular}{@{}p{3.0cm}p{2.2cm}p{4.9cm}r@{}}
+    \toprule
+    视频标签 & 场景类型 & 来源说明 & 抽样帧数 \\
+    \midrule
+    Getty 雾视频 & 真实雾视频 & 根目录真实雾天监控视频 & 168 \\
+    稀疏车流对照 & 晴天稀疏车流对照 & UA-DETRAC 序列 \code{MVI_40152} & 60 \\
+    中等车流对照 & 晴天中等车流对照 & UA-DETRAC 序列 \code{MVI_20033} & 60 \\
+    较重车流对照 & 晴天较重车流对照 & UA-DETRAC 序列 \code{MVI_20011} & 60 \\
+    密集车流对照 & 晴天密集车流对照 & UA-DETRAC 序列 \code{MVI_20035} & 60 \\
+    \midrule
+    合计 & -- & 1 段真实雾视频 + 4 段晴天对照视频 & 408 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+与只使用单段真实雾视频相比，引入多段晴天对照视频片段的意义在于：它把统一模型的主要短板暴露得更加明确。若一个权重只能在单段雾视频上表现尚可，却在多段晴天交通对照视频上持续丢失检测能力，那么该权重并不适合作为最终工程路线的检测主模型。
+
+\section{评价指标}
+
+当前项目的评价指标分为两层。
+
+\subsection{训练指标}
+
+第一层是训练过程中的学习指标，包括：
 
 \begin{itemize}[leftmargin=2em]
-\item 原始训练监控序列：60
-\item 原始测试监控序列：40
-\item 训练图像总数：83791
-\item XML 标注文件数：60
-\item 深度缓存文件数：与原始训练图像数量一致，覆盖完整
+\item 检测损失；
+\item 雾分类损失；
+\item beta 回归损失；
+\item 总训练损失与总验证损失；
+\item 是否出现 non-finite gradient；
+\item 是否触发 AMP recovery。
 \end{itemize}
 
-这说明本文当前工程环境已经具备较为稳定的数据基础。需要注意的是，项目早期曾生成过一次数据审计报告，其样本统计与当前运行统计存在差异，原因在于数据整理状态、抽样时刻和运行阶段不同。论文中应优先采用当前脚本实际运行结果，因为它直接对应本文撰写时的真实训练环境。
+这些指标主要服务于训练稳定性判断，回答“模型是否在收敛”“是否数值稳定”“某种损失权重策略是否可训练”等问题。
 
-\section{评价指标设计}
+\subsection{视频级指标}
 
-为了较全面评价本文方法，实验指标设计分为三部分。
-
-第一，检测任务指标。后续完整实验中应使用 Precision、Recall、mAP@0.5 和 mAP@0.5:0.95 作为标准检测指标，同时结合雾天视频上的实际框稳定性进行定性分析。由于当前统一模型仍在进一步续训，本文初稿阶段重点保留检测评估框架，并对已有早期权重在真实雾视频上的表现进行工程分析。
-
-第二，雾分类任务指标。对于 \texttt{clear / uniform / patchy} 三分类任务，可采用 Accuracy、Macro-F1、混淆矩阵等指标。其中，\texttt{patchy} 类别的识别能力尤为重要，因为它更贴近高速公路团雾的实际风险特征。
-
-第三，beta 回归任务指标。由于 beta 为连续变量，适合采用 MSE、MAE、RMSE 以及与类别等级的一致性分析作为评价方法。考虑到当前 beta 主要来自在线合成监督，因此其数值意义更侧重“相对强弱”而非绝对气象站量测值，后续若能引入真实能见度标定数据，则可进一步采用与真实能见度或散射参数的相关性进行校验。
-
-除上述定量指标外，本文还特别重视系统级验证指标，包括：推理速度、视频导出稳定性、复杂场景可视化质量、混合推理的工程可用性、右下角雾浓度分布图的解释效果等。
-
-\section{训练流程与当前状态分析}
-
-在训练组织上，本文使用 \texttt{src/train.py} 作为统一入口，并实现了以下训练特性：
+第二层是离线路线评估中的视频级工程指标。与常见目标检测论文不同，当前阶段的真实雾视频并不具备逐框人工标注，因此本文不强行给出缺少标注支撑的 mAP，而是使用更贴近当前业务目标的指标：
 
 \begin{itemize}[leftmargin=2em]
-\item 支持 checkpoint 自动恢复；
-\item 支持训练和验证缺失深度缓存自动补算；
-\item 支持 AMP 混合精度训练；
-\item 支持对非有限梯度进行监控与恢复；
-\item 支持保存 \texttt{unified\_model.pt} 与 \texttt{unified\_model\_best.pt}；
-\item 支持后续进入 QAT 和 INT8 转换流程。
+\item \code{mean_count_per_frame}：平均每帧检测数；
+\item \code{frames_with_detections_ratio}：非零检测帧占比；
+\item \code{weighted_beta_mean}：beta 全局均值；
+\item \code{weighted_dominant_switch_rate}：主导雾类别切换率；
+\item \code{weighted_beta_abs_delta_mean}：beta 帧间抖动强度；
+\item \code{heuristic_persistent_static_fp_per_min}：启发式持续静止误检频率；
+\item \code{mean_confirmation_latency_frames}：目标从首次出现到被确认显示的平均延迟；
+\item \code{route recommendation}：在统一路线与混合路线之间的综合推荐结果。
 \end{itemize}
 
-当前工作区中最早的 checkpoint 记录显示，模型在首个 epoch 完成后保存，训练损失约为 6.9528，验证损失约为 6.3626。这个结果说明统一模型主链已经具备收敛基础，但尚处于早期阶段。后续实际推理表明，该阶段权重在雾分类和 beta 回归方面可以输出稳定数值，但在真实雾视频上的车辆检测性能仍不够理想，因此本文在系统演示阶段一度采用混合推理完成车辆与雾状态的联合可视化。
+这些指标与当前代码实现严格对应，尤其对应 \code{scripts/evaluate_inference_routes.py}、\code{scripts/run_multi_model_benchmark.py} 和 \code{scripts/benchmark_candidate_model.py} 中的结构化输出。因此，论文中的实验结论与工作区中的 JSON / CSV 结果之间具有一一对应关系。
 
-在本稿写作过程中，项目进一步完成了一轮带边界的快速微调。该微调仍从现有 checkpoint 继续训练，但将单个 epoch 的训练 batch 限制为 600、验证 batch 限制为 150，以便在较短时间内获得更新权重。训练结果显示，第二个可用 epoch 的平均训练损失已下降到 3.1791，验证损失为 7.8716；继续训练后，在第三个 epoch 上训练损失进一步下降到 2.5315，验证损失下降到 2.5609，并刷新当前最佳模型。若进一步观察损失分解项，可见检测损失虽仍占主导，但雾分类损失已从早期大约 1.1 的水平继续降低到 0.344 左右，beta 回归损失也维持在较小量级。这说明本文提出的多任务组织方式不仅可训练，而且在短程续训后已经明显改善了雾任务的收敛状态。
+在本文定稿阶段，项目进一步补充实现了 \code{scripts/evaluate_uadetrac_detection_metrics.py}，用于在 UA-DETRAC 验证集上统计单类车辆检测的 Precision、Recall、mAP@0.5 和 mAP@0.5:0.95\cite{uadetrac}。因此，当前论文已经同时具备“标准检测指标”和“视频级工程指标”两套评价层次：前者更适合回答清晰天气域上的检测质量问题，后者更适合回答真实视频演示路线该如何选择的问题。
 
-根据这次快速微调生成的 \texttt{summary.json} 和 \texttt{metrics.jsonl}，系统目前已完成 FP32 阶段的受限续训，并得到新的 \texttt{unified\_model\_best.pt} 与 \texttt{checkpoint\_epoch\_0003.pt}。因此，从论文撰写角度看，本文已不再只是“方法设计 + 代码打通”，而是已经拥有一版经过继续优化的可用权重，为后续补充更完整的定量实验结果提供了基础。
+\section[fogfocus\textunderscore{}full 训练结果]{fogfocus\textunderscore{}full 训练结果}
+
+当前论文正式采用的主训练结果来自 \code{outputs/Fog_Detection_Project_fogfocus_full}。这轮训练从 \code{fogfocus} 路线已有 checkpoint 继续，核心意图是：在关闭检测损失、冻结检测器的条件下，更集中地优化雾分类头与 beta 回归头。
+
+本轮训练的关键设置如表~\ref{tab:fogfocus_full_setup} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{\code{fogfocus_full} 正式训练的关键设置}
+  \label{tab:fogfocus_full_setup}
+  \small
+  \begin{tabular}{@{}p{3.8cm}p{8.2cm}@{}}
+    \toprule
+    项目 & 取值 \\
+    \midrule
+    起始 checkpoint & \code{outputs/Fog_Detection_Project_fogfocus/checkpoints/checkpoint_epoch_0004.pt} \\
+    输出目录 & \code{outputs/Fog_Detection_Project_fogfocus_full} \\
+    总 epoch 数 & 12 \\
+    学习率 & $1\times10^{-5}$ \\
+    \code{FREEZE_YOLO_FOR_FOG} & 1 \\
+    \code{DET_LOSS_WEIGHT} & 0.0 \\
+    \code{FOG_CLS_LOSS_WEIGHT} & 1.75 \\
+    \code{FOG_REG_LOSS_WEIGHT} & 1.35 \\
+    \code{MAX_TRAIN_BATCHES / MAX_VAL_BATCHES} & 0 / 0（不做冒烟测试限制） \\
+    \code{SKIP_QAT} & 1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+训练结果摘要如表~\ref{tab:fogfocus_full_result} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{\code{fogfocus_full} 正式训练结果摘要}
+  \label{tab:fogfocus_full_result}
+  \small
+  \begin{tabular}{@{}lr@{}}
+    \toprule
+    指标 & 数值 \\
+    \midrule
+    最佳验证损失 & 1.0072 \\
+    第 12 个 epoch 训练总损失 & 0.9346 \\
+    第 12 个 epoch 验证总损失 & 1.0072 \\
+    训练阶段 fog classification loss & 0.5340 \\
+    验证阶段 fog classification loss & 0.5754 \\
+    训练阶段 fog regression loss & $1.322\times10^{-4}$ \\
+    是否出现 non-finite gradient & 否 \\
+    是否触发 AMP recovery & 否 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+该结果表明，当前系统已经不再停留在“仅能完成一次冒烟测试级试跑”的阶段，而是能够在完整 epoch 条件下稳定推进雾任务优化。尤其是 \code{best_loss = 1.0072} 的出现，使 \code{outputs/Fog_Detection_Project_fogfocus_full/unified_model_best.pt} 成为当前最适合写入论文正式实验部分的雾权重参考点。
 
 \begin{figure}[htbp]
   \centering
@@ -120,84 +209,269 @@
   \label{fig:beta_distribution}
 \end{figure}
 
-\section{当前视频推理结果分析}
+\section{真实雾视频结果}
 
-为了评估系统在真实下载视频上的适用性，本文选取根目录中的雾天交通视频片段进行推理验证。该视频时长约 28 秒，分辨率为 768×432，帧率为 30 FPS，内容为固定机位下的浓雾道路监控场景，符合“固定监控视角 + 雾天气 + 车流经过”的研究需求。
+为了观察正式雾权重在真实雾视频上的表现，本文首先对根目录中的 \code{gettyimages-1353950094-640_adpp.mp4} 做单视频路线评估。该视频分辨率为 768$\times$432，帧率为 30 FPS，在 \code{sample_stride = 5} 下共抽样 168 帧。
 
-首先，直接使用当前统一模型权重在抽样帧上进行推理，系统能够输出相对稳定的雾分类概率和 beta 数值。对若干代表帧的抽样结果显示，beta 大约稳定在 0.050 左右，雾类别概率集中在 \texttt{uniform} 与 \texttt{patchy} 附近，说明模型已经感知到该视频并非无雾场景。尽管数值本身还不能直接替代真实能见度量测，但它为后续通过 EMA 平滑和动态阈值进行联动提供了基础。
+根据 \code{scripts/postprocess_fogfocus_full.py} 触发的路线评估结果，\code{fogfocus_full} 在该视频上的关键表现如表~\ref{tab:getty_real_fog_result} 所示。
 
-其次，直接让当前统一模型承担车辆检测任务时，在该真实雾视频上的检测结果偏弱，部分抽样帧检测数接近 0。这与模型当前训练轮次较少、合成雾到真实雾仍存在域偏移有关。为验证系统其他部分的工程可行性，本文进一步用原始预训练 \code{yolo11n.pt} 在相同视频上进行车辆检测测试。结果表明，预训练 YOLO11n 在中后段车流密集区段可稳定检出多辆车、卡车和公交车，说明真实视频场景中的车辆目标本身是可检测的，问题主要集中在统一模型的联合训练尚需进一步加强。
+\begin{table}[htbp]
+  \centering
+  \caption{正式 \code{fogfocus_full} 权重在真实雾视频上的结果}
+  \label{tab:getty_real_fog_result}
+  \small
+  \begin{tabular}{@{}p{4.2cm}p{7.6cm}@{}}
+    \toprule
+    指标 & 数值 \\
+    \midrule
+    抽样帧数 & 168 \\
+    mean beta & 0.06709 \\
+    主导雾类别直方图 & \code{CLEAR: 2 / UNIFORM: 102 / PATCHY: 64} \\
+    统一路线平均检测数/帧 & 0.685 \\
+    统一路线非零检测帧占比 & 0.571 \\
+    混合路线平均检测数/帧 & 1.768 \\
+    推荐路线 & \code{hybrid} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
-再次，本文实现的混合推理策略能够较好解决阶段性效果不均衡问题。该策略使用 \code{yolo11n.pt} 负责车辆检测，统一模型负责雾分类和 beta 估计，并将二者结果同时绘制到视频中。从系统效果上看，输出视频已经能够在同一画面中展示车辆检测框、雾状态文字、beta 数值以及右下角雾浓度分布图，形成了较强的演示完整性和可解释性。
+这一结果首先说明：\code{fogfocus_full} 已经明显打破默认统一模型在真实雾视频上“几乎全判 \code{clear}”的塌缩现象。换言之，雾分支的正式训练确实起到了作用。其次，它也同时说明：雾分支的改善并没有自动转化为检测分支的根本性提升。即使统一路线已经能稳定输出非 \code{clear} 主导的天气判断，其车辆检测表现仍弱于独立 \code{yolo11n.pt} 支撑的混合路线。
 
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=\textwidth]{table_01_method_comparison.png}
-  \caption{当前可用方案对比表}
+  \caption{当前可用方案对比图}
   \label{fig:method_comparison}
 \end{figure}
 
-\section{雾浓度分布图的小地图分析}
+\section[benchmark\textunderscore{}v1 多模型结果]{benchmark\textunderscore{}v1 多模型结果}
 
-在本文后续工程实现中，系统进一步将右下角的简单 beta 数字扩展为带中文标题、颜色刻度条和分级标签的“雾浓度分布图”。该面板包含：
+\subsection{聚合结果}
+
+仅看单段真实雾视频仍不足以支撑“论文正式模型选择”。为此，项目进一步使用 \code{benchmark_v1} 对 4 套 baseline 模型做了正式多模型基准评估。参与对比的模型分别是：
 
 \begin{itemize}[leftmargin=2em]
-\item 中文标题“雾浓度分布图”；
-\item 低、中、高三段颜色刻度条；
-\item 基于均值分档的“轻雾 / 中雾 / 浓雾”标签；
-\item 全局 beta 数值与局部相对雾强度小地图。
+\item \code{default_baseline}
+\item \code{fogfocus}
+\item \code{videoadapt}
+\item \code{fogfocus_full}
 \end{itemize}
 
-需要再次说明的是，这张小地图并非模型直接预测的逐像素浓度图，而是利用当前帧图像的局部对比度、饱和度和亮度白化程度构建的相对空间雾浓度估计，并使用全局 beta 做强度校正。从科学严谨性上说，它还不能替代真实空间能见度反演；但从系统演示和交互解释上看，它非常适合体现“同一画面不同位置雾浓度不同”的业务直觉。对于毕业设计答辩而言，这种设计可显著提高系统结果的可读性。
+聚合结果如表~\ref{tab:benchmark_v1_aggregate} 所示。
 
-\section{方法优势分析}
+\begin{table}[htbp]
+  \centering
+  \caption{\code{benchmark_v1} 正式多模型聚合结果}
+  \label{tab:benchmark_v1_aggregate}
+  \scriptsize
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    模型 & 统一均值/帧 & 非零帧占比 & 混合减统一 & beta 均值 & fog switch rate & beta abs delta \\
+    \midrule
+    \code{default_baseline} & 5.637 & 0.757 & 12.390 & 0.004624 & 0.000000 & 0.000141 \\
+    \code{fogfocus} & 6.549 & 0.824 & 11.478 & 0.034476 & 0.007444 & 0.000999 \\
+    \code{videoadapt} & 5.637 & 0.757 & 12.390 & 0.004711 & 0.000000 & 0.000138 \\
+    \code{fogfocus_full} & 6.549 & 0.824 & 11.478 & 0.029682 & 0.032258 & 0.000906 \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
 
-结合当前工程实现与初步结果，本文方法具有如下优势。
+从中可以得到三点直接结论。
 
-第一，数据利用效率高。通过复用清晰交通监控数据和在线造雾机制，系统避免了对大规模真实团雾标注数据的强依赖，降低了研究门槛。
+第一，\code{fogfocus} 与 \code{fogfocus_full} 在统一路线检测数和非零检测帧占比上并列当前最强，说明“偏雾天气头强化”确实能带来比默认统一模型更好的综合视频级表现。第二，\code{videoadapt} 虽然在单段目标视频适配上具有工程意义，但从当前 \code{benchmark_v1} 的 5 段视频正式结果看，它并未在统一路线检测指标上超越默认基线。第三，4 套模型的推荐路线全部仍然是 \code{hybrid}，这意味着截至当前工作区，最终工程演示路线并没有因为任何一版统一权重而被翻转。
 
-第二，任务组织紧密。统一模型将检测、分类和回归整合到同一特征空间中，使天气感知与目标感知不再割裂。
+值得注意的是，\code{fogfocus_full} 虽然与 \code{fogfocus} 在统一路线检测指标上并列，但它的 \code{weighted_beta_mean} 更低、\code{weighted_beta_abs_delta_mean} 略好，而 \code{weighted_dominant_switch_rate} 更高。这说明正式完整训练主要改变的是雾分支的分布特征和平滑性，而不是让统一检测分支完成质变。
 
-第三，工程链路完整。当前项目不仅能训练，还具备数据自检、深度缓存补算、视频推理、混合推理、导出和量化路径，说明它不是纸面模型，而是可运行系统。
+\subsection{分视频结果}
 
-第四，具有较强扩展性。后续既可以继续强化统一模型训练，也可以引入真实雾视频做微调，甚至将右下角小地图替换为真正的密集雾浓度预测头。
+进一步按视频展开 \code{fogfocus_full} 的结果，可得到表~\ref{tab:fogfocus_full_per_video}。
 
-\section{当前不足与原因分析}
+\begin{table}[htbp]
+  \centering
+  \caption{\code{fogfocus_full} 在 \code{benchmark_v1} 各视频上的表现}
+  \label{tab:fogfocus_full_per_video}
+  \small
+  \begin{tabular}{@{}p{3.3cm}cccc@{}}
+    \toprule
+    视频 & 统一均值/帧 & 混合均值/帧 & 差值（hybrid-unified） & 主导雾类别 \\
+    \midrule
+    Getty 雾视频 & 0.685 & 1.768 & 1.083 & \code{UNIFORM FOG} \\
+    稀疏车流对照 & 7.117 & 21.050 & 13.933 & \code{CLEAR} \\
+    中等车流对照 & 5.983 & 29.300 & 23.317 & \code{CLEAR} \\
+    较重车流对照 & 11.883 & 29.150 & 17.267 & \code{CLEAR} \\
+    密集车流对照 & 17.633 & 38.133 & 20.500 & \code{CLEAR} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
-尽管本文已经形成较完整的研究和工程框架，但当前系统仍存在以下不足。
+这张表把统一模型当前的真正短板暴露得非常清楚：在真实雾视频上，统一路线和混合路线之间已经存在稳定差距；而在 4 段晴天对照视频片段上，这种差距进一步被放大。由此可见，当前统一模型的问题并不只是“雾头不够稳定”，更关键的是 \textbf{晴天交通视频中的检测能力仍然明显弱于独立 \code{yolo11n}}。
 
-第一，统一模型对真实雾视频中的车辆检测能力仍然偏弱。根本原因在于当前训练轮次较少、真实雾域与合成雾域仍有差距，而且多任务联合训练中检测损失占主导，天气头与检测头之间的最优平衡尚未完全建立。
+\section{UA-DETRAC 检测指标}
 
-第二，beta 回归的物理标定尚不充分。本文中的 beta 来自合成监督，虽然有连续性与可解释性，但尚未与真实气象站能见度、透射率或 LIDAR 观测建立严格映射关系。
+为了补足更标准的检测侧证据，本文新增实现了 \code{scripts/evaluate_uadetrac_detection_metrics.py}，在 UA-DETRAC 验证集上对若干关键权重做单类车辆检测评估。该脚本沿用论文正文一致的输入尺寸、letterbox 几何约定和验证划分规则，在清晰天气域上统计 Precision、Recall、mAP@0.5 和 mAP@0.5:0.95。结果如表~\ref{tab:uadetrac_standard_det_metrics} 所示。
 
-第三，右下角空间雾浓度小地图目前是相对估计而非端到端预测。它更适合作为工程解释增强，而不能直接作为严谨的科学测量结果。
+\begin{table}[htbp]
+  \centering
+  \caption{UA-DETRAC 验证集上的标准检测指标}
+  \label{tab:uadetrac_standard_det_metrics}
+  \small
+  \begin{tabular}{@{}p{3.6cm}ccccp{3.0cm}@{}}
+    \toprule
+    方法 & Precision & Recall & mAP@0.5 & mAP@0.5:0.95 & 说明 \\
+    \midrule
+    默认 unified 模型 & 0.8836 & 0.8038 & 0.8937 & 0.6570 & \code{outputs/Fog_Detection_Project/unified_model_best.pt} \\
+    \code{fogfocus} 权重 & 0.8720 & 0.7700 & 0.8645 & 0.6204 & \code{outputs/Fog_Detection_Project_fogfocus/unified_model_best.pt} \\
+    \code{fogfocus_full} 权重 & 0.8720 & 0.7700 & 0.8645 & 0.6204 & \code{outputs/Fog_Detection_Project_fogfocus_full/unified_model_best.pt} \\
+    \code{yolo11n} 车辆基线 & 0.8077 & 0.7344 & 0.8102 & 0.5714 & 最终混合路线所使用的独立检测器 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
-第四，实验对比仍需在完整训练结束后进一步完善。包括不同 backbone 的对比、是否使用深度缓存的消融、是否使用 patchy 模式的消融、不同损失权重的影响、动态阈值机制的作用等，都值得在终稿阶段补充更完整的定量表格。
+为使表~\ref{tab:uadetrac_standard_det_metrics} 的数值结果更具可读性，图~\ref{fig:detection_error_cases} 进一步给出了 \code{fogfocus_full} 权重在 UA-DETRAC 验证集上的一例典型漏检和一例典型误检。左图中，高亮框对应被漏检的车辆目标；右图中，高亮框对应高置信误检区域。可以看到，这些错误往往并非发生在目标完全不可见的场景，而是更容易出现在遮挡、透视形变、目标边界不完整或相邻车辆结构相互干扰的区域。
 
-\section{后续实验补充建议}
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.96\textwidth]{fig_10_detection_error_cases.png}
+  \caption{UA-DETRAC 验证集上的典型漏检与误检案例}
+  \label{fig:detection_error_cases}
+\end{figure}
 
-为进一步提升论文完整性，建议在后续终稿中补充以下实验：
+表~\ref{tab:uadetrac_standard_det_metrics} 至少说明了三件事。
+
+第一，若只看 UA-DETRAC 清晰天气验证集上的标准检测指标，默认 unified 模型实际上是当前表现最好的。这与其训练来源是一致的：默认 unified 检测分支直接在当前单类车辆任务上优化，因此在同域晴天验证集上取得最高 Precision、Recall 和 mAP 并不意外。
+
+第二，\code{fogfocus} 与 \code{fogfocus_full} 的检测指标完全一致，这与当前训练策略严格对应。原因在于 \code{fogfocus_full} 正式训练阶段冻结了检测器并把 \code{DET_LOSS_WEIGHT} 设为 0，因此其正式训练主要改变的是雾分类头和 beta 回归头，而不是检测分支本身。于是，晴天验证集上的检测指标与 \code{fogfocus} 保持一致是合理现象，而不是统计误差。
+
+第三，\code{yolo11n} 在 UA-DETRAC 晴天验证集上的标准检测指标反而低于经过单类任务适配的 unified 检测分支。这一点看似与前文的混合路线推荐结论相矛盾，但实则回答的是不同问题：UA-DETRAC 标准检测指标衡量的是“在同域清晰验证集上，检测器对单类车辆标注的拟合质量”；而 \code{benchmark_v1} 的路线评估衡量的是“在真实雾视频和少量晴天对照视频片段上，经过各自推理策略、阈值、时序过滤和可视化保留逻辑后，哪条完整路线更适合作为当前系统演示方案”。两类指标面向的问题不同，因此出现“标准检测表默认 unified 更强，但视频级推荐仍是 hybrid”的结果，并不冲突。
+
+进一步从论文写作角度看，这张标准检测表的重要意义在于，它让本文不再只是依赖视频级现象判断检测分支的好坏，而是补上了一张更符合目标检测研究习惯的量化表。与此同时，它也迫使我们对当前系统做出更细致的分层判断：\textbf{默认 unified 在同域晴天车辆检测上并不弱；当前真正困难的，是如何把这种清晰天气检测能力与真实雾场景下的天气感知能力、视频级稳定性和时序过滤逻辑统一到一条更优的完整路线中。}
+
+\section{检测回拉分支实验}
+
+为了尝试修复上述短板，项目在 \code{fogfocus_full} 之后继续开展了三条检测能力回拉分支：\code{clearpreserve_pilot}、\code{detectorrecovery_pilot} 和 \code{cocohead_pilot}。它们的定位并不相同：
+
+\begin{itemize}[leftmargin=2em]
+\item \code{clearpreserve_pilot}：在保留雾任务的同时，通过清晰图检测损失辅助恢复检测能力；
+\item \code{detectorrecovery_pilot}：进一步只做 clear 图检测恢复，观察“纯检测回拉”是否更有效；
+\item \code{cocohead_pilot}：不再压缩为单类检测头，而是保留 COCO 80 类检测头结构。
+\end{itemize}
+
+这三条分支在正式候选模型基准评估中的聚合结果如表~\ref{tab:detector_recovery_branches} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{三条检测能力回拉分支的候选 benchmark 结果}
+  \label{tab:detector_recovery_branches}
+  \scriptsize
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    分支 & 统一均值/帧 & 非零帧占比 & 混合减统一 & beta 均值 & fog switch rate & 判定结果 \\
+    \midrule
+    \code{clearpreserve_pilot} & 5.645 & 0.723 & 12.382 & 0.0485 & 0.0720 & 未通过 \\
+    \code{detectorrecovery_pilot} & 5.760 & 0.691 & 12.267 & 0.0536 & 0.0447 & 未通过 \\
+    \code{cocohead_pilot} & 0.074 & 0.071 & 17.953 & 0.0494 & 0.0571 & 未通过 \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+需要特别强调的是，表中的“未通过”不是论文作者主观评价，而是由 \code{scripts/benchmark_candidate_model.py} 根据统一路线平均检测数、非零检测帧占比、fog 切换率和 beta 抖动等门槛自动给出的判定结论。三条分支全部未能通过门槛判定，说明当前问题并不能通过“临时补一轮检测损失”或“简单切换检测头模式”被快速修复。
+
+进一步观察可以发现：
 
 \begin{enumerate}[leftmargin=2.5em]
-\item \textbf{完整训练结果表。} 补充统一模型在多个 epoch 后的检测、分类和回归指标。
-\item \textbf{消融实验。} 比较“无深度 / 有深度”“仅均匀雾 / 加入 patchy 雾”“单任务 / 多任务”三类设置。
-\item \textbf{对比实验。} 以纯检测模型、单独雾分类模型、传统去雾 + 检测方法作为对比。
-\item \textbf{真实视频测试。} 在更多监控视频上统计 beta 时序稳定性和类别切换行为。
-\item \textbf{部署实验。} 补充 ONNX、INT8 或边缘设备上的推理速度对比。
+\item \code{clearpreserve_pilot} 的统一平均检测数与默认基线基本持平，但非零检测帧占比下降，且 fog 切换率明显恶化，说明它没有实现“检测回补而雾任务保持稳定”的预期。
+\item \code{detectorrecovery_pilot} 在统一平均检测数上略高于 \code{clearpreserve_pilot}，但非零检测帧占比更差，说明“只做 clear 图检测恢复”同样未能解决根问题。
+\item \code{cocohead_pilot} 则出现了最明显的失败：保留 COCO 80 类检测头并没有带来检测能力恢复，反而使统一路线的检测数量几乎崩塌。
 \end{enumerate}
 
-只要这些实验在终稿阶段补充到位，本文的方法论、工程实现和论文结构都具备形成完整毕业设计成果的基础。
+从研究视角看，这些失败分支并非负担，而是具有分析价值的结果。它们说明：统一模型当前的检测短板并不是某一个超参数或某一个头部形状选择就能轻易修复，而更可能与“真实雾域和合成雾域的差距”“单类检测头长期冻结后的表示退化”“统一模型在晴天对照视频片段上的检测表达不足”等更深层原因有关。也正因如此，论文最终应当保留这些失败结论，而不是只保留成功路线。
 
-\section{与陕西交通部门现状结合的应用分析}
+\section{静止误检治理实验}
+
+\subsection{轨迹级指标}
+
+为把“静止背景物体持续被误检成车辆”的问题从经验现象收口成可评估对象，项目在 \code{Route_Eval_temporal_smoke} 中加入了轨迹日志、逐帧过滤摘要和启发式静止误检指标。当前 5 段视频冒烟路线评估在 \code{sample_stride = 10}、\code{max_frames = 40} 下得到的聚合结果如表~\ref{tab:temporal_fp_metrics} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{静止假车误检治理冒烟评估的聚合指标}
+  \label{tab:temporal_fp_metrics}
+  \small
+  \begin{tabular}{@{}lcc@{}}
+    \toprule
+    指标 & 统一路线 & 混合路线 \\
+    \midrule
+    \code{heuristic_persistent_static_fp_per_min} & 29.35 & 58.70 \\
+    \code{suppressed_heuristic_persistent_static_fp_per_min} & 29.35 & 48.91 \\
+    \code{mean_confirmation_latency_frames} & 31.53 & 32.47 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+这些值不是带逐轨迹人工真值的严格误检率，但它们已经能够稳定回答两个问题：第一，当前静止误检现象确实存在，而且在混合路线中更严重；第二，时序过滤并不是“删掉所有低置信框”的粗暴后处理，而是以轨迹级形式显式记录了确认延迟、静止候选数量和已抑制静止候选数量。
+
+\subsection{patch 复核与 negatives}
+
+在当前工作区中，时序过滤器已经能够把被判为静止可疑或已抑制的轨迹导出为 patch。当前一轮冒烟测试共导出了 16 个 patch，其中统一路线 3 个、混合路线 13 个。随后，\code{scripts/build_static_fp_review_pack.py} 会基于置信度、运动强度、道路先验和外观概率，为这些 patch 赋予 \code{likely_false_positive}、\code{review_required} 和 \code{needs_careful_review} 等启发式标签。
+
+在此基础上，项目又保守收口出一版 \code{Hard_Negatives_static_fp_v1}。当前该数据集中共有 4 个 bootstrap hard negatives，全部来自真实雾视频中的高置信非车辆误检。尽管规模很小，但这已经足以证明“轨迹日志导出 $\rightarrow$ patch 复核 $\rightarrow$ bootstrap negatives 收口”这条工程链路不是停留在文档层面的设想，而是已经形成真实产物。
+
+\subsection{二次复核器}
+
+基于上述 bootstrap negatives 和从 UA-DETRAC 中裁切得到的车辆正样本，当前项目训练了一版 \code{MobileNetV3_Small} 二分类复核器。其训练摘要显示：
+
+\begin{itemize}[leftmargin=2em]
+\item 车辆正样本数：96
+\item bootstrap 负样本数：9
+\item 最佳验证准确率：0.96875
+\end{itemize}
+
+更重要的是，当前工作区并不是只有“分类器训练成功”的离线结果，而是已经把这版权重回接到了 \code{TemporalVehicleFilter} 中。一次面向真实雾视频的二阶段复核冒烟评估显示，轨迹日志中已经明确出现 \code{appearance_non_vehicle} 作为抑制原因，且 \code{second_stage_classifier_enabled = True}、\code{init_error = None}。这说明二次复核器已经能够在真实推理链中实际生效，而不只是训练后孤立保存在某个目录中。
+
+当然，就当前 1 段视频、40 个抽样帧的二阶段复核冒烟结果而言，还不足以严谨宣称“二次复核器已经显著降低静止误检率”。原因在于当前视频规模很小、阈值设置仍较保守，而且 per-minute 指标在超短视频上会被放大。更准确的结论应当是：\textbf{二次复核器的训练、加载、打分和回接路径已经打通，但其泛化收益仍需在更大视频集上继续验证。}
+
+\section{结果讨论}
+
+综合正式训练、正式基准评估和误检治理实验，可以得到以下判断。
+
+第一，当前项目最稳固的成功点在于雾分支。无论从 \code{fogfocus_full} 的训练曲线、单段真实雾视频上的非 \code{clear} 主导结果，还是 5 段视频正式基准评估中 \code{fogfocus / fogfocus_full} 对默认基线的提升来看，雾分类与 beta 回归已经从“能跑”进入“可稳定输出、可做正式比较”的阶段。
+
+第二，当前统一模型最明确的短板仍然是检测分支，尤其是在晴天对照视频片段上的车辆检测能力。正式基准评估与三条失败回拉分支都指向同一结论：这一短板不是某个临时微调脚本就能轻易修补的，因此当前最务实的系统路线仍然是“统一模型负责雾感知，独立 YOLO 负责车辆检测”的混合方案。
+
+第三，项目的工程价值已经不再只体现在“有一个模型文件”。当前代码库已经形成了配置统一、训练可恢复、基准评估可复用、候选模型可门槛判定、静止误检可回灌的完整实验基础设施。对于毕业设计而言，这一点非常关键，因为它使论文不再只是展示一个静态结果，而是展示一个可持续迭代的工程研究框架。
+
+\section{当前不足}
+
+尽管论文主线已经能够和当前代码及实验产物保持一致，但从严格研究角度看，仍存在以下不足。
+
+\begin{enumerate}[leftmargin=2.5em]
+\item \textbf{真实雾视频覆盖仍然不足。} 当前 \code{benchmark_v1} 虽然已经从“单视频模板”扩展到 5 段有效视频资产，但其中真实雾视频仍只有 1 段，其余 4 段为晴天对照视频片段。
+\item \textbf{真实雾域上的标注型检测指标仍然缺失。} 当前新增的标准检测表已经覆盖 UA-DETRAC 晴天验证集，但真实雾视频仍缺少逐框人工标注，因此无法在雾域上给出同等严格的 mAP 对照。
+\item \textbf{beta 仍缺少外部物理标定。} 当前 beta 具有稳定的相对意义，但尚未与真实能见度仪或气象站观测建立严格对应关系。
+\item \textbf{二次复核器数据规模较小。} 当前 bootstrap negatives 的规模只足以证明链路可行，尚不足以支撑更强泛化结论。
+\item \textbf{系统性消融仍待完善。} 后续可围绕是否使用深度、是否加入 \code{patchy} 模式、是否接入时序过滤和二次复核器等因素开展对照实验。
+\end{enumerate}
+
+因此，后续更严格的补充实验应优先围绕以下三类展开：其一，在 UA-DETRAC 验证集上补充标准检测指标；其二，在更多真实雾视频上扩展 \code{benchmark_v2}；其三，对静止误检治理链做成体系的消融实验，而不是只保留冒烟路线证据。
+
+\section{应用分析}
 
 若结合陕西交通运输部门当前的运行管理现状来看，本文项目的应用价值可以从“可接入、可解释、可联动、可渐进部署”四个维度进一步理解。
 
-首先，从“可接入”角度看，陕西省交通运输系统并不缺监控和监测基础，而是更需要让既有视频资源具备更强的场景理解能力。陕西省交通运输厅公开预算资料中已明确列出“陕西省高速公路网运行监测能力提升”项目，说明省级层面已持续投入路网运行监测。与此同时，陕西省高速公路监测预警系统建设（第一批）覆盖 18 家路段分公司、142 处风险点，表明监测预警建设已经从理念阶段进入实施阶段。对于本文项目而言，这意味着它不需要重新建设前端感知设施，而可以优先以软件方式接入既有监控视频流，在现有体系中增加雾分类、beta、车辆检测三类结果。
+首先，从“可接入”角度看，陕西省交通运输系统并不缺监控和监测基础，而是更需要让既有视频资源具备更强的场景理解能力。陕西省交通运输厅公开预算资料中已明确列出“陕西省高速公路网运行监测能力提升”项目，说明省级层面已持续投入路网运行监测。与此同时，陕西省高速公路监测预警系统建设（第一批）覆盖 18 家路段分公司、142 处风险点，表明监测预警建设已经从理念阶段进入实施阶段\cite{shaanxiBudget2025,shaanxiRiskProject2025}。对于本文项目而言，这意味着它不需要重新建设前端感知设施，而可以优先以软件方式接入既有监控视频流，在现有体系中增加雾分类、beta、车辆检测三类结果。
 
-其次，从“可解释”角度看，陕西交通部门在实际运行中需要的不只是一个黑盒判定，而是能够参与值班研判和协同处置的解释型结果。公路运行周报机制表明，陕西省公路局会持续接收并转发气象灾害预警信息，并结合重点线路交通量开展路网研判；这类业务并不是简单地看“是否有雾”，而是要回答“雾有多重、车流有多大、是否需要限速、是否需要分流、是否要提前预置力量”等更具体的问题。本文项目的雾类型、beta 连续值、车辆检测数量与动态阈值联动结果，恰好能对应这种解释需求：既可为值班人员提供直观依据，也可为后续等级化策略设计提供参数基础。
+其次，从“可解释”角度看，陕西交通部门在实际运行中需要的不只是一个黑盒判定，而是能够参与值班研判和协同处置的解释型结果。公路运行周报机制表明，陕西省公路局会持续接收并转发气象灾害预警信息，并结合重点线路交通量开展路网研判；这类业务并不是简单地看“是否有雾”，而是要回答“雾有多重、车流有多大、是否需要限速、是否需要分流、是否要提前预置力量”等更具体的问题\cite{shaanxiWeekly2025,shaanxiWhitepaper2024}。本文项目的雾类型、beta 连续值、车辆检测数量与动态阈值联动结果，恰好能对应这种解释需求：既可为值班人员提供直观依据，也可为后续等级化策略设计提供参数基础。
 
-再次，从“可联动”角度看，陕西已经在恶劣天气处置方面形成较强的部门协同意识。2025 年 12 月的陕渝省际高速公路低温雨雪冰冻天气暨隧道突发事件应急演练，完整展示了监测预警、会商研判、力量预置、交通管控和救援保障等环节的联动过程。这说明，真正有价值的系统并不是只在视频里画几个框，而是要能够成为联动链条中的一环。本文项目若部署在陕西场景中，其输出结果最适合作为“一路多方”会商前端的视觉补充信息：例如把“uniform / patchy + beta + 当前检测数 + 代表帧截图”同步推送给值班调度、路政、养护、收费和交警协同体系，用于辅助判定风险等级和控制策略。
+再次，从“可联动”角度看，陕西已经在恶劣天气处置方面形成较强的部门协同意识。2025 年 12 月的陕渝省际高速公路低温雨雪冰冻天气暨隧道突发事件应急演练，完整展示了监测预警、会商研判、力量预置、交通管控和救援保障等环节的联动过程\cite{shaanxiEmergency2025}。这说明，真正有价值的系统并不是只在视频里画几个框，而是要能够成为联动链条中的一环。本文项目若部署在陕西场景中，其输出结果最适合作为“一路多方”会商前端的视觉补充信息：例如把“uniform / patchy + beta + 当前检测数 + 代表帧截图”同步推送给值班调度、路政、养护、收费和交警协同体系，用于辅助判定风险等级和控制策略。
 
-最后，从“可渐进部署”角度看，本文前期路线评估结果也与陕西场景的工程现实较为一致。当前离线对比显示，采用 \code{fogfocus} 权重后，雾分支已经能够明显打破默认模型“全判 clear”的塌缩问题；但在车辆检测层面，混合方案仍显著优于统一模型。因此，如果面向陕西交通部门做原型验证，最务实的选择并不是强行坚持“一个模型做完所有事”，而是优先采用“偏雾天权重 + 独立 YOLO 检测”的混合方案。这样做更符合政府部门信息化项目的落地逻辑：先保障结果可靠可用，再逐步推进统一模型替代，而不是为了模型结构上的“完整性”牺牲当前可交付性。
+最后，从“可渐进部署”角度看，当前正式基准评估的结论与陕西场景的工程现实较为一致。当前离线对比已经反复表明：统一模型在雾感知层面已经有明显进展，但在车辆检测层面仍弱于混合路线。因此，若面向陕西交通部门开展原型验证，最务实的选择并不是强行坚持“一个模型做完所有事”，而是优先采用“正式雾任务权重 + 独立 YOLO 检测”的混合方案。这样做更符合政府部门信息化项目的落地逻辑：先保证结果可靠可用，再逐步推进统一模型替代，而不是为了模型结构完整性牺牲当前可交付性。
 
-综合来看，本文项目与陕西交通部门现状的结合，不应停留在论文背景层面的“举例说明”，而应进一步明确为一种可落地的应用路径：以既有监控视频为输入，以雾风险识别为核心，以协同联动和分级处置为目标，在陕西现有监测预警和路网运行体系中形成一个可逐步接入、逐步验证、逐步扩展的智能感知模块。这样的定位既能提升论文的区域针对性，也能使项目本身更接近真实行业场景。
+综合来看，本文项目与陕西交通部门现状的结合，不应停留在论文背景层面的“举例说明”，而应进一步明确为一种可落地的应用路径：以既有监控视频为输入，以雾风险识别为核心，以协同联动和分级处置为目标，在陕西现有监测预警和路网运行体系中形成一个可逐步接入、逐步验证、逐步扩展的智能感知模块。
+
+\section{本章小结}
+
+本章围绕训练结果、视频级基准评估、标准检测指标、误差案例以及静止误检治理链，对当前工作区中的实验产物进行了系统分析。结果表明：一方面，\code{fogfocus_full} 已经能够作为正式论文中的雾任务参考权重，说明统一模型的雾分类与 beta 回归分支具备较稳定的训练与推理表现；另一方面，正式基准评估又明确暴露出统一模型在晴天对照视频片段上的检测短板，使“正式雾任务权重 + 独立 YOLO 检测”的混合路线成为当前阶段最务实的工程方案。同时，静止误检治理链和二次复核器训练结果说明，项目已经具备从视频级误检现象出发，逐步形成可记录、可复核、可回灌闭环的工程能力。这些结论共同构成了全文总结与后续展望的实验依据。

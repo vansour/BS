@@ -1,6 +1,10 @@
-\chapter{视频推理系统设计、可视化与部署实现}
+\chapter{系统实现与推理部署}
 
-\section{统一模型推理流程}
+\section{引言}
+
+对于本科毕业设计而言，方法是否真正“成型”并不只看训练脚本能否运行，还要看模型是否能够稳定接入视频流、输出可解释结果、完成可视化展示，并为后续部署预留接口。因此，在统一多任务模型训练完成之后，还需要从系统实现角度把推理、后处理、可视化、混合推理、离线路线评估和导出部署组织成一条完整链路。本章将围绕这一目标，对当前项目的推理系统设计与部署实现方式进行说明。
+
+\section{统一推理流程}
 
 统一模型推理由 \code{src/inference.py} 中的 \code{HighwayFogSystem} 封装完成。系统首先根据配置自动解析模型权重路径，优先选择 \code{unified_model_best.pt}；若不存在，则回退至 \code{unified_model.pt} 或最新 checkpoint。随后，系统对视频帧执行如下流程：
 
@@ -9,6 +13,8 @@
 \item 按训练阶段一致的规则执行 letterbox 预处理；
 \item 输入统一多任务模型，得到检测输出、雾分类 logits 和 beta 回归值；
 \item 对检测结果执行 NMS；
+\item 将检测框从 letterbox 坐标系还原到原始帧坐标系；
+\item 使用 \code{TemporalVehicleFilter} 对检测框做跨帧关联与轨迹级过滤；
 \item 对 beta 进行 EMA 平滑；
 \item 根据平滑后的 beta 计算自适应置信度阈值；
 \item 绘制车辆检测框、雾状态和 beta 信息。
@@ -16,29 +22,49 @@
 
 这种推理链保留了训练-推理一致性，也使雾估计不再只是附加文本输出，而是直接参与检测显示策略控制。
 
-\section{动态阈值机制}
+\section{时序过滤与二次复核}
+
+在真实高速公路监控视频中，仅依赖单帧外观进行车辆检测，会出现一种典型误检：某些路边设施、标识、反光结构、阴影或高亮背景在多帧中长时间维持稳定形状，从而被持续检测为 \code{vehicle}。为解决这一问题，本文在 \code{src/temporal_vehicle_filter.py} 中实现了轨迹级时序过滤模块 \code{TemporalVehicleFilter}，并将其同时接入统一推理路线、混合推理路线以及离线 benchmark 评估脚本\cite{improvedDeepsortFog2024}。
+
+该模块首先基于 IoU 对跨帧检测框进行轻量级关联，形成轨迹；随后为每条轨迹维护 \code{tentative}、\code{confirmed}、\code{suspicious} 和 \code{suppressed} 四类状态，并统计以下特征：
+
+\begin{itemize}[leftmargin=2em]
+\item 连续命中帧数与连续丢失帧数；
+\item 平均置信度；
+\item 中心点位移；
+\item 框面积变化；
+\item 局部运动强度；
+\item 可选道路 ROI 先验分数；
+\item patch 级二次外观复核概率。
+\end{itemize}
+
+其中，时序过滤的核心思想不是“静止即删除”，而是：只有当某轨迹在连续多帧内同时满足“位移极小、尺度变化极小、局部运动极低，并且置信度或外观复核概率不足以证明其为真实车辆”时，才将其从 \code{confirmed} 转为 \code{suspicious} 或 \code{suppressed}。这样做可以尽量避免把真实堵车、缓行或临停车辆错误剔除。
+
+在此基础上，本文还实现了 patch 级二次外观复核器。默认情况下，该复核器可以使用轻量 \code{MobileNetV3_Small} 的 ImageNet 预训练语义作为车辆先验；若工作区中存在项目内训练得到的二分类权重，则同一接口还可切换为 \code{vehicle / non_vehicle} 二分类模式。由于该复核器只运行在少量可疑静止轨迹上，而不是对全帧全部目标执行二次识别，因此额外推理开销较为可控。
+
+\section{动态阈值}
 
 在低能见度场景下，固定检测阈值容易造成漏检。若仍使用与晴天相同的较高阈值，模型可能在轻度或中度雾中丢失一些本就较弱的车辆响应。为此，本文在推理阶段设置基础阈值 \code{BASE_CONF_THRES = 0.25}，再根据平滑后的 beta 值进行动态调整。当前代码中的核心思想可以概括为：
-
-\[
+\begin{equation}
 conf_{adaptive} = \max(conf_{min}, conf_{base} - k\hat{\beta})
-\]
+\end{equation}
 
-其中 \texttt{conf\_min = 0.15}，\texttt{k = 1.2}。这意味着当雾浓度上升时，系统会适当降低显示阈值，保留更多潜在目标。虽然这种策略还不是严格意义上的风险最优控制，但它体现了一种重要思想：天气感知结果应当反馈到目标检测显示策略，而不是与检测分离。
+其中 \code{conf_min = 0.15}，\code{k = 1.2}。这意味着当雾浓度上升时，系统会适当降低显示阈值，保留更多潜在目标。虽然这种策略还不是严格意义上的风险最优控制，但它体现了一种重要思想：天气感知结果应当反馈到目标检测显示策略，而不是与检测分离。
 
-\section{运行时多流与异步组织}
+\section{多流异步组织}
 
-若运行设备为 CUDA，\texttt{HighwayFogSystem} 会创建预处理流、推理流和后处理流，尽量让不同阶段形成轻量级流水线。虽然在当前项目规模下，多流并不能使每一步都完全并行，但它有助于降低 CPU/GPU 空转等待，使视频演示更加流畅。该设计说明本文在实现中不仅考虑了算法正确性，也兼顾了运行效率与展示效果。
+若运行设备为 CUDA，\code{HighwayFogSystem} 会创建预处理流、推理流和后处理流，尽量让不同阶段形成轻量级流水线。虽然在当前项目规模下，多流并不能使每一步都完全并行，但它有助于降低 CPU/GPU 空转等待，使视频演示更加流畅。该设计说明本文在实现中不仅考虑了算法正确性，也兼顾了运行效率与展示效果。
 
-\section{混合推理方案}
+\section{混合推理}
 
-在本文工程推进过程中发现：当前统一模型早期训练权重已经能够给出合理的雾分类概率和 beta 数值，但对真实下载雾视频中的车辆检测效果不如原始预训练 \texttt{yolo11n.pt} 稳定。考虑到毕业设计需要尽快形成“车辆 + 雾状态 + 雾浓度”同时可视化的结果，本文进一步实现了位于 \texttt{scripts/hybrid\_fog\_vehicle\_infer.py} 的混合推理脚本。
+在本文工程推进过程中发现：当前统一模型虽然在雾分类与 beta 估计上已形成较稳定的输出，但对真实下载雾视频中的车辆检测效果仍不如原始预训练 \code{yolo11n.pt} 稳定。考虑到毕业设计不仅要验证统一建模思路，还需要形成“车辆 + 雾状态 + 雾浓度”同时可视化且可连续演示的系统结果，本文进一步实现了位于 \code{scripts/hybrid_fog_vehicle_infer.py} 的混合推理脚本。
 
 该脚本采用如下策略：
 
 \begin{itemize}[leftmargin=2em]
-\item 用 \texttt{yolo11n.pt} 负责真实视频中的车辆检测；
+\item 用 \code{yolo11n.pt} 负责真实视频中的车辆检测\cite{ultralyticsDocs}；
 \item 用统一多任务模型负责雾分类和 beta 估计；
+\item 对 YOLO 检测结果同样接入 \code{TemporalVehicleFilter}，保证统一路线与混合路线共享同一套静止误检治理逻辑；
 \item 将两者结果在同一视频中叠加显示；
 \item 在右下角构建“雾浓度分布图”小地图，用于增强对空间非均匀雾的直观解释。
 \end{itemize}
@@ -52,11 +78,11 @@ conf_{adaptive} = \max(conf_{min}, conf_{base} - k\hat{\beta})
   \label{fig:inference_visualization}
 \end{figure}
 
-\section{雾浓度分布图的构建思路}
+\section{雾浓度分布图}
 
 需要指出的是，当前统一模型输出的是整帧一个 beta 值，而不是逐像素的雾浓度图。因此，右下角的小地图并不是模型直接回归得到的“真值级空间雾图”，而是一种基于图像局部对比度、饱和度和亮度白化程度估算得到的相对空间雾浓度分布图，并使用全局 beta 对其进行强度校正。
 
-这一设计虽然不是严格物理反演，但具备三个优点：第一，能够在演示视频中直观体现“同一画面不同位置雾强度可能不同”；第二，结合全局 beta 可获得相对稳定的整体浓淡变化；第三，工程实现简单，不需要额外训练密集预测网络。对于论文初稿和系统展示阶段，这种设计已经具有较强的解释性。
+这一设计虽然不是严格物理反演，但具备三个优点：第一，能够在演示视频中直观体现“同一画面不同位置雾强度可能不同”；第二，结合全局 beta 可获得相对稳定的整体浓淡变化；第三，工程实现简单，不需要额外训练密集预测网络。在当前项目阶段，它已经足以承担“工程解释增强层”的职责，并为后续是否值得引入真正的密集雾浓度预测头提供观察依据。
 
 \begin{figure}[htbp]
   \centering
@@ -65,6 +91,22 @@ conf_{adaptive} = \max(conf_{min}, conf_{base} - k\hat{\beta})
   \label{fig:fog_map_example}
 \end{figure}
 
-\section{导出与部署路径}
+\section{导出与部署}
 
-为了使本文方法具备更明确的工程延展性，项目还实现了 \texttt{src/export.py} 导出脚本。该脚本可将统一模型导出为 ONNX，并给出 TensorRT INT8 引擎构建示例和 Jetson 部署提示。训练脚本中则保留了 QAT 和 INT8 转换路径。虽然本文目前仍以桌面 GPU 环境下的模型训练和视频推理为主，但从代码结构上看，后续迁移到边缘设备、收费站终端或路侧计算节点具备可操作基础。
+为了使本文方法具备更明确的工程延展性，项目还实现了 \code{src/export.py} 导出脚本。该脚本可将统一模型导出为 ONNX，并给出 TensorRT INT8 引擎构建示例和 Jetson 部署提示；训练脚本中则保留了 QAT 和 INT8 转换路径\cite{pytorchDocs,ultralyticsDocs}。虽然本文目前仍以桌面 GPU 环境下的模型训练和视频推理为主，但从代码结构上看，后续迁移到边缘设备、收费站终端或路侧计算节点具备可操作基础。
+
+\section{离线评估与 benchmark}
+
+随着训练分支逐步增多，仅靠人工观看单个演示视频已无法稳定回答“哪一版权重更适合作为论文正式结果”“统一路线是否真的优于混合路线”“某次检测器修补试验是否值得继续”这类问题。为此，项目围绕 \code{scripts/evaluate_inference_routes.py}、\code{scripts/run_multi_model_benchmark.py}、\code{scripts/benchmark_candidate_model.py} 和 \code{scripts/postprocess_fogfocus_full.py} 形成了一条较完整的离线 benchmark 工具链。
+
+其中，\code{scripts/evaluate_inference_routes.py} 的职责是：在同一采样策略下，对统一路线和混合路线同时执行离线评估，输出逐帧 CSV、轨迹日志、逐帧过滤摘要、差异代表帧和总报告。该脚本不强行给出缺少标注支撑的 mAP，而是统计每帧检测数、平均置信度、fog 概率、beta 时序稳定性以及静止误检启发式指标。这种指标组织方式更符合当前“系统原型 + 视频级可解释验证”的阶段目标。
+
+\code{scripts/run_multi_model_benchmark.py} 则在单模型路线评估之上增加一层编排能力，使多组雾权重能够共享同一 benchmark 视频集和同一采样策略，并输出跨模型的 \code{model_overview.csv}、\code{model_video_matrix.csv} 与综合 \code{multi_model_benchmark_summary.json}。对论文而言，这意味着“正式模型为什么选这一版”可以从单次经验判断，提升为有固定基准、固定资产和固定输出格式支撑的多模型横向比较。
+
+进一步地，\code{scripts/benchmark_candidate_model.py} 又把“候选模型是否能替代当前 baseline”转化为一套门槛判断流程。它会把候选模型临时并入 baseline 集合，然后根据统一路线平均检测数、非零检测帧占比、fog 切换率和 beta 抖动等指标，与各 baseline 逐一比较并给出门槛判定结果。这种设计避免了仅凭单次主观观察选择模型，而是把“是否值得进入正式集合”收口成一套可复查的脚本化判定逻辑。
+
+最后，\code{scripts/postprocess_fogfocus_full.py} 将正式训练后的处理流程标准化：它会自动找到最新训练 run，对最佳权重执行路线评估，并进一步触发候选模型对标，从而输出适合论文和答辩使用的精简总结。换言之，当前项目中的推理与部署并不只是“模型能跑起来”，而是已经具备“训练结束后自动沉淀可写入论文的结构化结果”的能力。这也体现了本文系统实现具备可复用实验平台的特征。
+
+\section{本章小结}
+
+本章围绕推理实现、可视化展示和部署准备三个层面，对本文系统的运行时链路进行了说明。首先，统一模型推理流程保证了训练与推理几何约束的一致性，并通过 beta 平滑和动态阈值联动增强了结果可解释性；其次，轨迹级时序过滤与二次外观复核使系统具备了视频级误检治理能力；再次，混合推理方案解决了当前阶段统一模型检测分支尚未完全成熟时的工程可交付问题；最后，离线路线评估、多模型 benchmark 和 ONNX / TensorRT / Jetson 导出路径又进一步表明，本文工作已经不再停留在单一模型验证层面，而是形成了一条完整的系统实现与推理部署链路。

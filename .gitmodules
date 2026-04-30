@@ -1,0 +1,3 @@
+[submodule "external/xduts"]
+	path = external/xduts
+	url = https://github.com/note286/xduts.git

@@ -1,6 +1,10 @@
-\chapter{统一多任务模型设计与训练优化}
+\chapter{统一多任务模型设计}
 
-\section{模型总体结构}
+\section{引言}
+
+在完成数据流构建之后，下一步核心问题是：如何把车辆检测、雾类型识别和雾浓度回归整合到同一网络中，并在保证训练可行性的同时兼顾后续部署需求。相比单任务模型，统一多任务模型既要考虑共享特征的提取方式，也要考虑检测头类别适配、分类头和回归头结构设计、损失函数组织以及训练稳定性控制。本章将围绕这些问题展开，重点说明本文统一多任务模型的结构设计与训练优化思路。
+
+\section{模型结构}
 
 本文统一多任务模型定义在 \code{src/model/unified_model.py} 中，命名为 \code{UnifiedMultiTaskModel}。模型整体结构采用“YOLO 共享主干 + 两个附加头”的形式，即：
 
@@ -11,7 +15,7 @@
 \item 在同一共享特征图上增加 beta 回归头。
 \end{enumerate}
 
-这种结构的核心思想是：车辆检测需要局部多尺度感知，而天气识别和雾浓度估计更偏全局语义；因此，将这三项任务放在同一主干上，可以在兼顾速度的同时利用高层共享特征实现协同学习。相比使用三套独立模型，这种设计具有参数更少、推理链路更短、部署更容易的优势。
+这种结构的核心思想是：车辆检测需要局部多尺度感知，而天气识别和雾浓度估计更偏全局语义；因此，将这三项任务放在同一主干上，可以在兼顾速度的同时利用高层共享特征实现协同学习。相比使用三套独立模型，这种设计具有参数更少、推理链路更短、部署更容易的优势\cite{caruana1997multitask,ultralyticsDocs}。
 
 \begin{figure}[htbp]
   \centering
@@ -20,13 +24,13 @@
   \label{fig:model_structure}
 \end{figure}
 
-\section{单类车辆检测头适配}
+\section{检测头适配}
 
-本文场景主要关注道路车辆，而不需要保留通用目标检测中的 80 类全部语义。因此，系统在配置中明确设定 \texttt{NUM\_DET\_CLASSES = 1}，类别名称为 \texttt{["vehicle"]}。然而，基础权重 \texttt{yolo11n.pt} 原本是在多类别数据上训练得到的，其检测头输出维度与单类任务不一致。为解决这一问题，本文在模型初始化阶段检测基础模型最后一层的类别数；若与当前任务不一致，则重建单类 \texttt{DetectionModel}，并从原始权重中选择形状兼容的参数进行非严格加载。
+本文场景主要关注道路车辆，而不需要保留通用目标检测中的 80 类全部语义。因此，系统在配置中明确设定 \code{NUM_DET_CLASSES = 1}，类别名称为 \code{["vehicle"]}。然而，基础权重 \code{yolo11n.pt} 原本是在多类别数据上训练得到的，其检测头输出维度与单类任务不一致。为解决这一问题，本文在模型初始化阶段检测基础模型最后一层的类别数；若与当前任务不一致，则重建单类 \code{DetectionModel}，并从原始权重中选择形状兼容的参数进行非严格加载。
 
-这种适配策略十分关键。若直接以严格模式加载多类权重到单类模型，程序会因 shape 不匹配失败；若完全放弃预训练权重，又会失去 backbone 和 neck 中已学到的大量通用视觉特征。本文采取的折中方案是：保留能复用的主干参数，仅重置类别不兼容的检测头部分。这样既能保留迁移学习优势，又能让模型适配当前道路监控单类检测任务。
+这种适配策略十分关键。若直接以严格模式加载多类权重到单类模型，程序会因 shape 不匹配失败；若完全放弃预训练权重，又会失去 backbone 和 neck 中已学到的大量通用视觉特征。本文采取的折中方案是：保留能复用的主干参数，仅重置类别不兼容的检测头部分。这样既能保留迁移学习优势，又能让模型适配当前道路监控单类检测任务\cite{ultralyticsDocs}。
 
-\section{雾分类头设计}
+\section{分类头设计}
 
 雾分类头的输入来自 YOLO 高层共享特征，而非直接使用原图像。其结构为：
 
@@ -39,48 +43,51 @@
 之所以采用全局平均池化，是因为雾类型识别更关注整幅画面的整体退化模式，而不是某个局部区域的细节。通过池化操作，模型可将空间特征压缩为全局描述向量，再通过全连接层完成三分类。当前雾类别定义为：
 
 \begin{itemize}[leftmargin=2em]
-\item \texttt{clear}
-\item \texttt{uniform}
-\item \texttt{patchy}
+\item \code{clear}
+\item \code{uniform}
+\item \code{patchy}
 \end{itemize}
 
-这三类设置兼顾了业务可理解性与训练可实现性。\texttt{clear} 表示无雾，\texttt{uniform} 表示均匀低能见度，\texttt{patchy} 则用于表示局地非均匀团雾。在实际管理中，\texttt{patchy} 比 \texttt{uniform} 更值得关注，因为它更容易诱发突发性风险。
+这三类设置兼顾了业务可理解性与训练可实现性。\code{clear} 表示无雾，\code{uniform} 表示均匀低能见度，\code{patchy} 则用于表示局地非均匀团雾。在实际管理中，\code{patchy} 比 \code{uniform} 更值得关注，因为它更容易诱发突发性风险。
 
-\section{beta 回归头设计}
+\section{回归头设计}
 
 回归头同样基于共享高层特征设计，其结构为：
 
-\texttt{AdaptiveAvgPool2d -> Flatten -> Linear(128) -> ReLU -> Linear(1) -> Sigmoid}
+\begin{center}
+\small
+\code{AdaptiveAvgPool2d -> Flatten -> Linear(128)}\\
+\code{-> ReLU -> Linear(1) -> Sigmoid}
+\end{center}
 
-其中最终使用 \texttt{Sigmoid} 将输出压缩到 \texttt{[0,1]} 范围，再在训练与推理阶段按 \texttt{Config.BETA\_MAX} 做缩放。这意味着模型回归的并不是原始物理量纲下的绝对散射系数，而是相对于预设上界的归一化值。当前实现中，回归目标在 clear 样本上被显式置为 0，在有雾样本上由在线造雾过程给出真实采样 beta。因此，该回归头可以被视为学习“当前画面相对于训练雾强度上限的退化程度”。
+其中最终使用 \code{Sigmoid} 将输出压缩到 \code{[0,1]} 范围，再在训练与推理阶段按 \code{Config.BETA_MAX} 做缩放。这意味着模型回归的并不是原始物理量纲下的绝对散射系数，而是相对于预设上界的归一化值。当前实现中，回归目标在 clear 样本上被显式置为 0，在有雾样本上由在线造雾过程给出真实采样 beta。因此，该回归头可以被视为学习“当前画面相对于训练雾强度上限的退化程度”。
 
 beta 回归的意义并不只是提供一个数字。对于系统应用而言，连续 beta 值可以进一步用于显示平滑、动态阈值控制、预警等级划分和小地图可视化，因此它是连接模型输出与业务联动的重要桥梁。
 
-\section{多任务前向传播与共享特征提取}
+\section{共享特征提取}
 
 与许多简单封装直接调用 \code{self.yolo(x)} 的方式不同，本文在 \code{forward()} 中手动遍历 \code{self.yolo.model} 各层前向传播，并尝试捕获 SPPF 或检测头前最后一张高层 4D 特征图作为共享特征。这一实现看似复杂，但非常必要。因为若只调用高层封装接口，往往难以在推理结构变化和训练/验证模式差异下稳定获得可供附加头使用的高层特征。
 
-本文采用的共享特征提取策略是：优先捕获 \texttt{SPPF} 层输出；若当前 YOLO 架构中无法明确识别 \texttt{SPPF}，则退化为检测头前最后一张 4D 特征图。这种设计提升了模型对不同 YOLO 规模和结构变体的适应性，也避免了把通道数写死在代码里。
+本文采用的共享特征提取策略是：优先捕获 \code{SPPF} 层输出；若当前 YOLO 架构中无法明确识别 \code{SPPF}，则退化为检测头前最后一张 4D 特征图。这种设计提升了模型对不同 YOLO 规模和结构变体的适应性，也避免了把通道数写死在代码里。
 
-\section{损失函数与联合优化}
+\section{损失设计与联合优化}
 
 训练阶段，检测、分类和回归三项任务同时纳入优化目标。具体而言：
 
 \begin{itemize}[leftmargin=2em]
-\item 检测损失直接调用 Ultralytics 提供的 detection loss；
-\item 雾分类损失使用 \texttt{CrossEntropyLoss}；
-\item beta 回归损失使用 \texttt{MSELoss}。
+\item 检测损失直接调用 Ultralytics 提供的 detection loss\cite{ultralyticsDocs}；
+\item 雾分类损失使用 \code{CrossEntropyLoss}；
+\item beta 回归损失使用 \code{MSELoss}。
 \end{itemize}
 
 总损失写为：
-
-\[
+\begin{equation}
 L = L_{det} + L_{cls} + L_{reg}
-\]
+\end{equation}
 
-虽然当前实现中三项任务权重均为 1.0，但这并不意味着三项损失在数值尺度上天然相等。实际训练中，检测损失往往明显高于雾分类与回归损失，这也是当前日志中“det 占主导，fog\_cls 与 fog\_reg 数值更小”的原因。对此，本文采取两种应对方式：一是通过共享高层特征让天气任务充分利用检测主干已有的表达能力，减轻天气头从零学习的压力；二是在实验设计中预留损失权重调整空间，以便后续根据收敛曲线进一步平衡不同任务。
+虽然当前实现中三项任务权重均为 1.0，但这并不意味着三项损失在数值尺度上天然相等。实际训练中，检测损失往往明显高于雾分类与回归损失，这也是当前日志中“det 占主导，\code{fog_cls} 与 \code{fog_reg} 数值更小”的原因。对此，本文采取两种应对方式：一是通过共享高层特征让天气任务充分利用检测主干已有的表达能力，减轻天气头从零学习的压力；二是在实验设计中预留损失权重调整空间，以便后续根据收敛曲线进一步平衡不同任务。
 
-\section{训练稳定性与工程保护机制}
+\section{训练稳定性设计}
 
 相比只关注最终精度的论文实现，本文训练脚本在工程稳定性方面做了较多保护设计。
 
@@ -88,12 +95,39 @@ L = L_{det} + L_{cls} + L_{reg}
 
 其次，训练过程支持缺失深度缓存自动补算。训练开始前会统计训练集和验证集各自缺少多少深度文件，若有缺失则自动调用预计算流程补齐，避免训练到验证阶段才因文件缺失报错。
 
-再次，脚本支持 AMP 混合精度训练，并监控非有限梯度比例。当前代码中实现了对 \texttt{NaN/Inf} 梯度的检测、告警、阈值判定以及必要时自动关闭 AMP 的恢复策略。这种设计在大 batch、长时间训练或量化感知训练切换中尤为重要。
+再次，脚本支持 AMP 混合精度训练，并监控非有限梯度比例。当前代码中实现了对 \code{NaN/Inf} 梯度的检测、告警、阈值判定以及必要时自动关闭 AMP 的恢复策略。这种设计在大 batch、长时间训练或量化感知训练切换中尤为重要。
 
-最后，系统保留了 QAT 与 INT8 转换路径。虽然当前毕业设计阶段更关注功能打通与方法验证，但在 \texttt{src/train.py} 中已经实现了 QAT 准备、observer 修复和 INT8 模型转换流程，为后续边缘部署提供了明确方向。
+最后，系统保留了 QAT 与 INT8 转换路径。虽然当前毕业设计阶段更关注功能打通与方法验证，但在 \code{src/train.py} 中已经实现了 QAT 准备、observer 修复和 INT8 模型转换流程，为后续边缘部署提供了明确方向。
 
-\section{当前训练状态与续训策略}
+\section{权重谱系与训练分支}
 
-在本文撰写时，项目工作区中已经存在一版训练权重和 checkpoint。现有 checkpoint 对应的训练记录显示，系统此前至少完成了首个 epoch 的训练，并保存了 \code{unified_model.pt}、\code{unified_model_best.pt} 以及 \code{checkpoint_epoch_0001.pt}。从工程验证看，这意味着统一模型主链已经能够完成参数更新、权重保存和推理调用；从效果层面看，早期权重在真实下载雾视频上的雾估计已可输出数值，但车辆检测稳定性仍不如直接使用预训练 YOLO11n 的结果，因此本文在系统演示阶段补充实现了混合推理策略。
+随着项目从“链路打通”进入“结果收口”阶段，当前工作区中的训练产物已经不再只有单一默认模型目录，而是形成了多条具有明确职责的权重谱系。
 
-为了进一步提升雾分类和 beta 回归可靠性，当前系统已在后台执行一轮“短程快速微调”：继续沿用现有 checkpoint，但对每个 epoch 的最大训练 batch 数和验证 batch 数做限制，从而在可接受时间内获得更新权重。这一策略的意义不在于替代完整训练，而在于为论文初稿撰写阶段提供更接近最终状态的参数版本，并为后续实验章节补充完整指标争取时间。
+第一条是默认统一模型谱系，对应 \code{outputs/Fog_Detection_Project}。它主要承担早期主链验证功能，证明统一模型可以完成数据装载、在线造雾、多任务前向、反向传播和权重保存等基本流程。第二条是偏雾天适配谱系，对应 \code{outputs/Fog_Detection_Project_fogfocus}。该路线通过提高雾任务权重并弱化检测器更新，重点缓解真实雾视频中天气头向 \code{clear} 过度塌缩的问题。第三条是目标视频适配谱系，对应 \code{outputs/Fog_Detection_Project_videoadapt_formal}，它利用 \code{scripts/adapt_fog_to_video.py} 对雾分类头和 beta 回归头做轻量视频级自适应。第四条则是当前论文正式采用的 \code{fogfocus_full} 谱系，对应 \code{outputs/Fog_Detection_Project_fogfocus_full}，其定位不再是短程冒烟测试级联调，而是完整 epoch 条件下的正式雾任务优化结果。
+
+为避免“论文里说一套、工程里跑一套”，当前项目还把这些权重进一步收口到 \code{configs/benchmark_models.json} 中，形成 \code{benchmark_v1} 的四类 baseline 角色：
+
+\begin{itemize}[leftmargin=2em]
+\item \code{default_baseline}：长期默认统一模型参考点；
+\item \code{fogfocus}：偏雾天气头强化参考点；
+\item \code{videoadapt}：目标视频适配参考点；
+\item \code{fogfocus_full}：正式完整训练参考点。
+\end{itemize}
+
+这种做法的重要意义在于：训练脚本、benchmark 脚本和论文实验章节可以围绕同一组可追踪模型目录展开，而不是依赖人工记忆某个临时权重文件名称。
+
+在 \code{fogfocus_full} 正式训练完成后，项目又针对统一模型在晴天对照视频片段上检测能力偏弱的问题，继续分化出三条“检测能力回拉”实验分支：
+
+\begin{enumerate}[leftmargin=2.5em]
+\item \textbf{clear-det-preserve 分支。} 由 \code{scripts/run_clear_det_preserve_train.sh} 启动，在保留 fog 分类与 beta 回归任务的同时，对清晰图像额外施加辅助检测损失，希望在不破坏雾任务的前提下回补晴天检测能力。
+\item \textbf{detector-recovery 分支。} 由 \code{scripts/run_detector_recovery_train.sh} 启动，进一步收缩目标，只在 clear 图上恢复检测器，而不再对雾任务施加损失，用于验证“纯检测回拉”是否比多任务协同回拉更有效。
+\item \textbf{COCO vehicle-head 分支。} 由 \code{scripts/run_coco_vehicle_head_pilot.sh} 启动，不再强制把检测头压缩成单类，而是保留 COCO 80 类检测头结构，训练时把 UA-DETRAC 车辆映射到 COCO \code{car} 类，推理时再折叠回 \code{vehicle}。
+\end{enumerate}
+
+从训练框架角度看，这三条分支说明本文脚本体系已经具备较强的实验组织能力：一方面支持通过环境变量快速切换损失权重、冻结策略、恢复 checkpoint 和检测头模式；另一方面也支持 \code{model-only} 恢复、\code{nonstrict} 参数加载以及重置 epoch 等结构迁移场景。换言之，当前训练代码不只是“能把一个模型训起来”，而是已经发展成能够支撑多轮假设验证与失败分支排查的工程实验平台。
+
+需要强调的是，分支实验“被实现出来”并不自动意味着“实验结论为正”。恰恰相反，当前代码库最有价值的一点，是把多条尝试路径的成功与失败都沉淀为了可复查的脚本、日志和 benchmark 结果。后续第七章将进一步结合 \code{candidate_benchmark_summary.json}、\code{multi_model_benchmark_summary.json} 和正式路线评估产物，对这些分支为何失败、失败体现在哪些指标上，以及它们对统一模型后续优化意味着什么，给出更完整分析。
+
+\section{本章小结}
+
+本章从模型结构和训练策略两个层面，系统说明了本文统一多任务方案的实现方式。首先，本文采用“YOLO 共享主干 + 雾分类头 + beta 回归头”的结构，把检测、分类和回归三类任务统一到同一网络中；其次，通过单类车辆检测头适配、共享高层特征捕获和联合损失组织，使统一模型既能保留预训练检测骨干的表达能力，又能兼顾雾天气任务的学习需求；再次，通过 checkpoint 续训、深度缓存自动补算、AMP 与非有限梯度保护、QAT/INT8 路径等工程机制，提高了训练过程的稳定性；最后，通过权重谱系和失败分支的组织，也说明当前训练框架已经具备支持多轮假设验证的工程能力。以上内容共同构成了后续视频推理和实验验证的模型基础。

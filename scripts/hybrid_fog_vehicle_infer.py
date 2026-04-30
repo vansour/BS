@@ -28,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.config import Config
 from src.inference import HighwayFogSystem
+from src.temporal_vehicle_filter import TemporalVehicleFilter
 from src.utils import resolve_model_weights
 
 
@@ -123,26 +124,42 @@ def make_video_writer(
     return avi_writer, fallback_path
 
 
-def draw_vehicle_detections(frame, result, conf_thres: float) -> tuple[object, int]:
+def extract_hybrid_detections(result, conf_thres: float) -> list[dict[str, object]]:
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
-        return frame, 0
+        return []
 
-    count = 0
-    xyxy_list = boxes.xyxy.int().cpu().tolist()
+    detections: list[dict[str, object]] = []
+    xyxy_list = boxes.xyxy.cpu().tolist()
     conf_list = boxes.conf.cpu().tolist()
     cls_list = boxes.cls.int().cpu().tolist()
-
     for xyxy, score, cls_id in zip(xyxy_list, conf_list, cls_list):
         if float(score) < conf_thres or int(cls_id) not in VEHICLE_CLASS_IDS:
             continue
+        detections.append(
+            {
+                "xyxy": [float(v) for v in xyxy],
+                "conf": float(score),
+                "cls_id": int(cls_id),
+                "name": VEHICLE_CLASS_NAMES.get(int(cls_id), str(cls_id)),
+            }
+        )
+    return detections
 
+
+def draw_vehicle_detections(frame, detections: list[dict[str, object]]) -> tuple[object, int]:
+    if not detections:
+        return frame, 0
+
+    count = 0
+    for det in detections:
         count += 1
-        x1, y1, x2, y2 = xyxy
-        class_name = VEHICLE_CLASS_NAMES.get(int(cls_id), str(cls_id))
+        x1, y1, x2, y2 = [int(round(value)) for value in det["xyxy"]]
+        score = float(det["conf"])
+        class_name = str(det["name"])
         color = (0, 255, 255) if class_name in {"bus", "truck"} else (80, 255, 80)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label = f"{class_name} {float(score):.2f}"
+        label = f"{class_name} {score:.2f}"
         cv2.putText(
             frame,
             label,
@@ -391,6 +408,8 @@ def main() -> int:
         video_source=str(video_path),
         cfg=cfg,
     )
+    fog_system.reset_temporal_state()
+    hybrid_filter = TemporalVehicleFilter.from_config(cfg, route_name="hybrid")
     yolo_model = YOLO(str(yolo_weights))
 
     cap = cv2.VideoCapture(str(video_path))
@@ -418,7 +437,11 @@ def main() -> int:
                 break
 
             frame_index += 1
-            fog_probs, beta, _ = fog_system.predict(frame)
+            fog_probs, beta, _ = fog_system.predict(
+                frame,
+                frame_index=frame_index - 1,
+                timestamp_sec=(frame_index - 1) / max(fps, 1e-6),
+            )
             fog_probs = np.asarray(fog_probs, dtype=np.float32)
             if ema_beta is None:
                 ema_beta = float(beta)
@@ -441,12 +464,18 @@ def main() -> int:
                 imgsz=args.imgsz,
                 classes=VEHICLE_CLASS_IDS,
             )[0]
+            hybrid_detections = extract_hybrid_detections(yolo_result, args.conf)
+            hybrid_detections, _ = hybrid_filter.filter_detection_dicts(
+                frame,
+                hybrid_detections,
+                frame_index=frame_index - 1,
+                timestamp_sec=(frame_index - 1) / max(fps, 1e-6),
+            )
 
             draw_frame = frame.copy()
             draw_frame, vehicle_count = draw_vehicle_detections(
                 draw_frame,
-                yolo_result,
-                args.conf,
+                hybrid_detections,
             )
             fog_map_panel, fog_map_mean = compute_spatial_fog_map(
                 frame,
@@ -469,8 +498,12 @@ def main() -> int:
     finally:
         cap.release()
         writer.release()
+        fog_system.flush_temporal_state()
+        hybrid_filter.flush()
 
     print(f"Saved hybrid inference video: {final_output_path}")
+    print(f"Unified temporal summary: {fog_system.get_temporal_summary(fps=fps)}")
+    print(f"Hybrid temporal summary: {hybrid_filter.build_summary(fps=fps)}")
     return 0
 
 

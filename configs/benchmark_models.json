@@ -1,0 +1,64 @@
+{
+  "benchmark_id": "benchmark_v1",
+  "description": "Formal benchmark_v1 baseline model set. Relative paths are resolved from the repository root.",
+  "selection_rules": [
+    "Keep one stable default baseline as the historical reference point.",
+    "Keep one fog-focused baseline to represent weather-head-oriented adaptation.",
+    "Keep one video-adapted baseline to represent target-video specialization.",
+    "Append new baseline roles under a new benchmark version instead of silently replacing benchmark_v1 roles."
+  ],
+  "models": [
+    {
+      "label": "default_baseline",
+      "slug": "default_baseline",
+      "fog_weights": "outputs/Fog_Detection_Project/unified_model_best.pt",
+      "tags": [
+        "benchmark_v1",
+        "default",
+        "baseline"
+      ],
+      "role": "historical_reference",
+      "status": "active",
+      "notes": "Stable default unified model baseline used as the long-term historical reference."
+    },
+    {
+      "label": "fogfocus",
+      "slug": "fogfocus",
+      "fog_weights": "outputs/Fog_Detection_Project_fogfocus/unified_model_best.pt",
+      "tags": [
+        "benchmark_v1",
+        "fogfocus",
+        "weather-head"
+      ],
+      "role": "fog_specialized_reference",
+      "status": "active",
+      "notes": "Fog-focused adaptation baseline representing weather-head-oriented specialization."
+    },
+    {
+      "label": "videoadapt",
+      "slug": "videoadapt",
+      "fog_weights": "outputs/Fog_Detection_Project_videoadapt_formal/unified_model_best.pt",
+      "tags": [
+        "benchmark_v1",
+        "videoadapt",
+        "target-video"
+      ],
+      "role": "target_video_reference",
+      "status": "active",
+      "notes": "Target-video adapted fog-head baseline representing deployment-specific specialization."
+    },
+    {
+      "label": "fogfocus_full",
+      "slug": "fogfocus_full",
+      "fog_weights": "outputs/Fog_Detection_Project_fogfocus_full/unified_model_best.pt",
+      "tags": [
+        "benchmark_v1",
+        "fogfocus-full",
+        "formal"
+      ],
+      "role": "formal_training_reference",
+      "status": "active",
+      "notes": "Formal fog-focused training result intended to represent the current strongest unified formal reference."
+    }
+  ]
+}

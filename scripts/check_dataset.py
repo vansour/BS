@@ -609,6 +609,11 @@ def write_markdown_report(report: dict[str, object], path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit the UA-DETRAC data pipeline.")
     parser.add_argument(
+        "--config",
+        default=None,
+        help="可选配置文件路径（.json/.yaml/.yml）。",
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help="报告输出目录，默认写入 outputs/Data_Audit。",
@@ -632,7 +637,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    cfg = Config()
+    cfg = Config(config_path=args.config)
     output_root = ensure_dir(
         Path(args.output_dir)
         if args.output_dir

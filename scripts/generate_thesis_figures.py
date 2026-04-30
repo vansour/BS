@@ -444,6 +444,7 @@ def fig_fog_confusion_matrix(cfg: Config, path: Path, sample_limit: int = 240, b
         cfg.YOLO_BASE_MODEL,
         cfg.NUM_FOG_CLASSES,
         num_det_classes=cfg.NUM_DET_CLASSES,
+        img_size=cfg.IMG_SIZE,
     ).to(device)
     load_model_weights(model, str(FOGFOCUS_WEIGHTS), map_location=device)
     model.eval()

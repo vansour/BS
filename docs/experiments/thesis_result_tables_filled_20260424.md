@@ -35,10 +35,15 @@
 
 | 方法 | 权重/设置 | Precision | Recall | mAP@0.5 | mAP@0.5:0.95 | 备注 |
 |---|---|---:|---:|---:|---:|---|
-| 纯 YOLO 单类检测基线 | 待补 | 待补 | 待补 | 待补 | 待补 | 建议后续在 UA-DETRAC val 上补正式指标 |
-| 统一模型检测分支（默认） | `Fog_Detection_Project/unified_model_best.pt` | 待补 | 待补 | 待补 | 待补 | 当前主要通过真实视频检测数做工程比较 |
-| 统一模型检测分支（完整训练后） | `Fog_Detection_Project_fogfocus_full/unified_model_best.pt` | 待补 | 待补 | 待补 | 待补 | 当前正式训练关闭检测损失，不宜直接宣称检测增强 |
-| 最终演示混合方案 | `yolo11n.pt` + `fogfocus_full` | - | - | - | - | 作为工程演示路线更优，严格 mAP 应独立统计 |
+| `yolo11n` 车辆基线 | `yolo11n.pt` | 0.8077 | 0.7344 | 0.8102 | 0.5714 | 最终混合路线使用的独立检测器 |
+| 统一模型检测分支（默认） | `Fog_Detection_Project/unified_model_best.pt` | 0.8836 | 0.8038 | 0.8937 | 0.6570 | UA-DETRAC clear-weather val 上当前最佳 |
+| 统一模型检测分支（fogfocus） | `Fog_Detection_Project_fogfocus/unified_model_best.pt` | 0.8720 | 0.7700 | 0.8645 | 0.6204 | 偏雾天气头适配后检测指标略降 |
+| 统一模型检测分支（完整训练后） | `Fog_Detection_Project_fogfocus_full/unified_model_best.pt` | 0.8720 | 0.7700 | 0.8645 | 0.6204 | 正式训练冻结检测器，因此与 `fogfocus` 一致 |
+
+说明：
+
+- 上表由 `scripts/evaluate_uadetrac_detection_metrics.py` 在 UA-DETRAC 验证集上统计得到。
+- 若论文保留“最终演示混合方案”这一表述，可直接说明其检测器部分继承 `yolo11n` 车辆基线指标。
 
 ## 表 5  多视频验证汇总表
 

@@ -19,6 +19,7 @@ Highway Fog Monitoring Inference Script
 
 import os
 import sys
+import argparse
 from typing import Optional, Tuple, Union
 
 import cv2
@@ -32,12 +33,34 @@ if project_root not in sys.path:
 
 from src.config import Config
 from src.model import UnifiedMultiTaskModel
+from src.temporal_vehicle_filter import TemporalVehicleFilter
 from src.utils import (
     invert_letterbox_boxes_xyxy,
     letterbox_tensor,
     load_model_weights,
     resolve_model_weights,
 )
+
+
+def parse_args() -> argparse.Namespace:
+    """解析推理脚本命令行参数。"""
+    parser = argparse.ArgumentParser(description="Highway fog monitoring inference entrypoint.")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="可选配置文件路径（.json/.yaml/.yml）。",
+    )
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="可选模型权重路径；未提供时按默认优先级自动解析。",
+    )
+    parser.add_argument(
+        "--video-source",
+        default=None,
+        help="可选视频源。可传摄像头编号字符串或视频文件路径。",
+    )
+    return parser.parse_args()
 
 
 class HighwayFogSystem:
@@ -83,6 +106,7 @@ class HighwayFogSystem:
             self.cfg.YOLO_BASE_MODEL,
             self.cfg.NUM_FOG_CLASSES,
             num_det_classes=self.cfg.NUM_DET_CLASSES,
+            img_size=self.cfg.IMG_SIZE,
         )
         self._load_model()
         self.model.to(self.device).eval()
@@ -113,7 +137,17 @@ class HighwayFogSystem:
         self.ema_beta = 0.0
         self.smooth_alpha = self.cfg.EMA_ALPHA
         self.base_conf_thres = self.cfg.BASE_CONF_THRES
+        self.beta_scale_factor = self.cfg.BETA_SCALE_FACTOR
+        self.min_conf_thres = self.cfg.MIN_CONF_THRES
+        self.display_window_width = self.cfg.DISPLAY_WINDOW_WIDTH
+        self.display_window_height = self.cfg.DISPLAY_WINDOW_HEIGHT
+        self.status_bar_height = self.cfg.STATUS_BAR_HEIGHT
         self.det_class_names = getattr(self.cfg, "DET_CLASS_NAMES", ["vehicle"])
+        self.temporal_filter = TemporalVehicleFilter.from_config(
+            self.cfg,
+            route_name="unified",
+        )
+        self.last_temporal_report = self.temporal_filter.last_report
 
     def _ensure_video_capture(self) -> bool:
         """
@@ -307,18 +341,58 @@ class HighwayFogSystem:
         """
         将检测结果统一整理为单类 `vehicle`。
 
-        在当前单类配置下，NMS 后的类别 id 理论上就只有 `0`。
-        这里保留一个轻量归一化步骤，是为了兼容旧结果或边界情况，
-        确保绘制逻辑始终看到统一的 `vehicle` 类别编号。
+        在 `single_vehicle` 模式下，NMS 后类别 id 理论上只有 `0`；
+        在 `coco_vehicle` 模式下，会先筛掉非车辆 COCO 类，再把车辆相关类
+        统一折叠成单一 `vehicle` 类编号，供后续展示路径复用。
         """
         if detections.numel() == 0:
             return detections
+
+        if detections.shape[1] > 5:
+            cls_ids = detections[:, 5].round().to(torch.int64)
+            vehicle_mask = torch.zeros_like(cls_ids, dtype=torch.bool)
+            for class_id in self.cfg.VEHICLE_CLASS_IDS:
+                vehicle_mask |= cls_ids == int(class_id)
+            detections = detections[vehicle_mask]
+            if detections.numel() == 0:
+                return torch.zeros((0, 6), dtype=torch.float32)
 
         vehicle_detections = detections.clone()
         vehicle_detections[:, 5] = 0.0
         return vehicle_detections
 
-    def predict(self, frame: np.ndarray) -> Tuple[np.ndarray, float, torch.Tensor]:
+    def reset_temporal_state(self):
+        """清空统一推理路线的时序过滤状态。"""
+        self.temporal_filter.reset()
+        self.last_temporal_report = self.temporal_filter.last_report
+
+    def flush_temporal_state(self):
+        """结束一个视频片段后，把当前活跃轨迹转入完成态。"""
+        self.temporal_filter.flush()
+
+    def get_last_temporal_report(self) -> dict[str, object]:
+        """返回最近一帧的时序过滤摘要。"""
+        return dict(self.last_temporal_report)
+
+    def get_temporal_summary(self, fps: float | None = None) -> dict[str, object]:
+        """返回统一路线当前累计的时序过滤统计。"""
+        return self.temporal_filter.build_summary(fps=fps)
+
+    def export_temporal_event_log(self) -> list[dict[str, object]]:
+        """导出统一路线的轨迹事件日志。"""
+        return self.temporal_filter.export_event_log()
+
+    def export_temporal_frame_reports(self) -> list[dict[str, object]]:
+        """导出统一路线的逐帧过滤摘要。"""
+        return self.temporal_filter.export_frame_reports()
+
+    def predict(
+        self,
+        frame: np.ndarray,
+        *,
+        frame_index: int | None = None,
+        timestamp_sec: float | None = None,
+    ) -> Tuple[np.ndarray, float, torch.Tensor]:
         """
         对单帧图像执行同步推理。
 
@@ -336,6 +410,12 @@ class HighwayFogSystem:
         outputs = self._inference_async(img_tensor)
         probs, beta, detections = self._postprocess_async(outputs)
         detections = self._restore_detections_to_original_frame(detections, preprocess_meta)
+        detections = self._apply_temporal_filter(
+            frame,
+            detections,
+            frame_index=frame_index,
+            timestamp_sec=timestamp_sec,
+        )
         return probs, beta, detections
 
     def _restore_detections_to_original_frame(
@@ -356,6 +436,29 @@ class HighwayFogSystem:
         restored = detections.clone()
         restored[:, :4] = invert_letterbox_boxes_xyxy(restored[:, :4], preprocess_meta)
         return restored
+
+    def _apply_temporal_filter(
+        self,
+        frame: np.ndarray,
+        detections: torch.Tensor,
+        *,
+        frame_index: int | None = None,
+        timestamp_sec: float | None = None,
+    ) -> torch.Tensor:
+        """
+        在原始帧坐标系下执行轨迹级过滤。
+
+        该步骤既影响实时显示，也影响 `predict()` 返回给外部调用方的结果，
+        从而保证 UI 路径和离线评估路径保持一致。
+        """
+        filtered, report = self.temporal_filter.filter_tensor_detections(
+            frame,
+            detections,
+            frame_index=frame_index,
+            timestamp_sec=timestamp_sec,
+        )
+        self.last_temporal_report = report
+        return filtered
 
     def _render_output_frame(
         self,
@@ -380,15 +483,33 @@ class HighwayFogSystem:
         if self.postprocess_stream:
             self.postprocess_stream.synchronize()
 
-        self.ema_beta = self.smooth_alpha * beta + (1 - self.smooth_alpha) * self.ema_beta
-        adaptive_conf = max(0.15, self.base_conf_thres - self.ema_beta * 1.2)
+        detections = self._restore_detections_to_original_frame(
+            detections,
+            preprocess_meta,
+        )
+        detections = self._apply_temporal_filter(frame, detections)
 
-        draw_frame = cv2.resize(frame, (960, 540))
+        self.ema_beta = self.smooth_alpha * beta + (1 - self.smooth_alpha) * self.ema_beta
+        adaptive_conf = max(
+            self.min_conf_thres,
+            self.base_conf_thres - self.ema_beta * self.beta_scale_factor,
+        )
+
+        draw_frame = cv2.resize(
+            frame,
+            (self.display_window_width, self.display_window_height),
+        )
         fog_idx = int(np.argmax(probs))
         status = self.FOG_CLASS_NAMES[fog_idx]
         color = self.FOG_COLORS[fog_idx]
 
-        cv2.rectangle(draw_frame, (0, 0), (960, 80), (45, 45, 45), -1)
+        cv2.rectangle(
+            draw_frame,
+            (0, 0),
+            (self.display_window_width, self.status_bar_height),
+            (45, 45, 45),
+            -1,
+        )
         cv2.putText(draw_frame, f"STATUS: {status}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
         info_line = (
@@ -402,10 +523,19 @@ class HighwayFogSystem:
             detections,
             adaptive_conf,
             fog_idx,
-            preprocess_meta,
+            frame.shape[:2],
         )
         det_line = f"Visible Detections: {det_count}"
-        cv2.putText(draw_frame, det_line, (720, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        det_text_x = max(20, self.display_window_width - 240)
+        cv2.putText(
+            draw_frame,
+            det_line,
+            (det_text_x, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+        )
 
         if fog_idx > 0:
             cv2.putText(
@@ -426,7 +556,7 @@ class HighwayFogSystem:
         detections: torch.Tensor,
         adaptive_conf: float,
         fog_idx: int,
-        preprocess_meta: dict[str, object],
+        src_shape: tuple[int, int],
     ) -> tuple[np.ndarray, int]:
         """
         在显示帧上绘制检测框。
@@ -436,7 +566,7 @@ class HighwayFogSystem:
             detections: NMS 后检测结果，格式为 `[x1, y1, x2, y2, conf, cls]`。
             adaptive_conf: 动态置信度阈值。
             fog_idx: 当前雾类型索引，用于选择显示颜色。
-            preprocess_meta: 当前帧输入阶段的 letterbox 元数据。
+            src_shape: 原始输入帧尺寸 `(height, width)`。
 
         Returns:
             tuple:
@@ -449,18 +579,13 @@ class HighwayFogSystem:
         if detections.numel() == 0:
             return frame, 0
 
-        if preprocess_meta is None:
-            return frame, 0
-
         display_boxes = detections[detections[:, 4] >= adaptive_conf]
         if display_boxes.numel() == 0:
             return frame, 0
 
-        # 检测框当前还处于 letterbox 输入坐标系，需要先还原到原始帧，
-        # 再根据展示分辨率做一次线性映射。
-        boxes = invert_letterbox_boxes_xyxy(display_boxes[:, :4], preprocess_meta)
-        src_h, src_w = preprocess_meta["src_shape"]
+        src_h, src_w = src_shape
         frame_h, frame_w = frame.shape[:2]
+        boxes = display_boxes[:, :4].clone()
         boxes[:, [0, 2]] *= frame_w / max(src_w, 1)
         boxes[:, [1, 3]] *= frame_h / max(src_h, 1)
 
@@ -489,6 +614,7 @@ class HighwayFogSystem:
         以尽量减少 GPU 和 CPU 的空闲等待。
         """
         print("Realtime pipeline is running. Press Q to exit.")
+        self.reset_temporal_state()
 
         if not self._ensure_video_capture():
             return
@@ -548,17 +674,30 @@ class HighwayFogSystem:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self.flush_temporal_state()
         cv2.destroyAllWindows()
 
 
 def main():
     """推理脚本入口函数。"""
+    args = parse_args()
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    cfg = Config()
-    model_path = resolve_model_weights(cfg.OUTPUT_DIR, cfg.CHECKPOINT_DIR)
-    video_source = os.path.join(base_dir, "..", "test_video.mp4")
-    if not os.path.exists(video_source):
-        video_source = 0
+    cfg = Config(config_path=args.config)
+    model_path = (
+        args.weights
+        or cfg.MODEL_PATH
+        or resolve_model_weights(cfg.OUTPUT_DIR, cfg.CHECKPOINT_DIR)
+    )
+    video_source_value = args.video_source if args.video_source is not None else cfg.VIDEO_SOURCE
+    if video_source_value is not None:
+        try:
+            video_source = int(video_source_value)
+        except (TypeError, ValueError):
+            video_source = str(video_source_value)
+    else:
+        video_source = os.path.join(base_dir, "..", "test_video.mp4")
+        if not os.path.exists(video_source):
+            video_source = 0
 
     system = HighwayFogSystem(model_path, video_source=video_source, cfg=cfg)
 
@@ -566,7 +705,10 @@ def main():
     # 无头环境下不弹 UI，而是跑一次最小烟雾推理，确认链路可执行。
     if os.name != "nt" and "DISPLAY" not in os.environ:
         print("Headless environment detected. Running a smoke inference.")
-        dummy_frame = np.zeros((540, 960, 3), dtype=np.uint8)
+        dummy_frame = np.zeros(
+            (cfg.DISPLAY_WINDOW_HEIGHT, cfg.DISPLAY_WINDOW_WIDTH, 3),
+            dtype=np.uint8,
+        )
         probs, beta, detections = system.predict(dummy_frame)
         print(f"Inference test: beta={beta:.4f}, prob={probs}, detections={len(detections)}")
     else:

@@ -1,18 +1,64 @@
-\chapter{终稿阶段建议补充的图表}
+\chapter{核心实现与复现实验说明}
 
-为便于后续从初稿快速过渡到终稿，建议在排版与实验完成后补充以下图表：
+为便于后续复核、扩展和工程复现，本附录对本文系统的主要文件组织、核心脚本和典型实验命令进行说明。附录内容不重复正文中的算法推导和实验分析，仅作为论文对应工程实现的补充材料。
+
+\section{项目主要文件组织}
+
+本文系统采用数据处理、模型训练、推理部署和论文材料相互分离的组织方式，主要目录如下。
 
 \begin{enumerate}[leftmargin=2.5em]
-\item 系统总体框架图
-\item 在线造雾原理图与三类天气样例图
-\item 统一多任务模型结构图
-\item 数据集构成统计表
-\item 训练与验证损失曲线图
-\item 雾分类混淆矩阵
-\item 不同训练轮次下 beta 分布图
-\item 推理结果可视化图
-\item 混合推理右下角“雾浓度分布图”示例图
-\item 与传统方法、单任务方法和多任务方法的对比实验表
+\item \code{src/}：系统核心源码目录，包含配置读取、统一多任务模型、训练流程、推理流程、模型导出和时序过滤等实现。
+\item \code{scripts/}：实验与数据处理脚本目录，包含数据检查、深度缓存预计算、候选模型评估、视频基准测试、论文图表生成和误检样本挖掘等工具。
+\item \code{configs/}：实验配置文件目录，用于保存模型训练、候选评估和视频基准测试所需的参数。
+\item \code{docs/experiments/}：实验记录与结果整理目录，用于保存不同训练分支、候选模型和基准评估的文字记录。
+\item \code{overleaf_thesis/}：论文 LaTeX 工程目录，包含西安电子科技大学本科毕业设计论文模板、正文、参考文献、图表和最终 PDF。
 \end{enumerate}
 
-上述图表一旦补齐，本文即可从“方法与系统完整的初稿”进一步过渡到“实验更扎实、形式更规范的终稿”。
+\section{核心源码文件说明}
+
+系统实现中与论文方法直接相关的核心文件包括：
+
+\begin{enumerate}[leftmargin=2.5em]
+\item \code{src/model/unified_model.py}：定义车辆检测、雾类型分类和 beta 回归统一建模结构，是本文多任务模型的核心实现。
+\item \code{src/train.py}：实现训练主流程，包括数据加载、在线造雾、多任务损失计算、混合精度训练、checkpoint 保存与续训。
+\item \code{src/inference.py}：实现单帧和视频推理所需的预处理、模型前向、检测结果后处理和雾状态输出。
+\item \code{src/temporal_vehicle_filter.py}：实现轨迹级时序过滤，用于抑制固定监控视频中持续出现的静止假车误检。
+\item \code{src/export.py}：提供模型导出接口，为后续 ONNX、TensorRT 和边缘端部署预留工程路径。
+\end{enumerate}
+
+\section{主要实验脚本说明}
+
+本文实验过程中使用的主要脚本包括：
+
+\begin{enumerate}[leftmargin=2.5em]
+\item \code{scripts/check_dataset.py}：检查数据集路径、图像文件、标注文件和基础统计信息。
+\item \code{scripts/precompute_depth_cache.py}：调用单目深度估计模型预计算深度缓存，降低训练阶段重复推理开销。
+\item \code{scripts/smoke_test.py}：执行训练前冒烟测试，验证数据读取、模型前向、损失计算和反向传播链路是否正常。
+\item \code{scripts/evaluate_uadetrac_detection_metrics.py}：在 UA-DETRAC 验证集上计算车辆检测相关指标。
+\item \code{scripts/run_multi_model_benchmark.py}：对多个候选模型和多段视频执行统一基准评估。
+\item \code{scripts/hybrid_fog_vehicle_infer.py}：实现“统一模型雾估计 + 独立 YOLO 车辆检测”的混合推理路线。
+\item \code{scripts/build_detection_error_case_figure.py}：生成论文中用于误差案例分析的可视化图。
+\end{enumerate}
+
+\section{典型复现实验命令}
+
+在依赖环境和数据路径配置完成后，可按如下流程复现本文主要实验链路。
+
+\begin{enumerate}[leftmargin=2.5em]
+\item 数据集检查：
+\code{python scripts/check_dataset.py}
+\item 深度缓存预计算：
+\code{python scripts/precompute_depth_cache.py}
+\item 训练前冒烟测试：
+\code{python scripts/smoke_test.py}
+\item 统一多任务模型训练：
+\code{python -m src.train}
+\item 候选模型视频基准评估：
+\code{python scripts/run_multi_model_benchmark.py}
+\item 混合推理视频生成：
+\code{python scripts/hybrid_fog_vehicle_infer.py}
+\item 论文 LaTeX 编译：
+\code{latexmk -xelatex -interaction=nonstopmode -halt-on-error main.tex}
+\end{enumerate}
+
+实际复现实验时，应根据本机数据集位置、权重文件路径和输出目录调整配置文件中的路径参数。若只进行论文编译，则无需运行模型训练脚本，只需保证 \code{overleaf_thesis/} 目录中的模板文件、章节文件、参考文献文件和图像文件完整即可。

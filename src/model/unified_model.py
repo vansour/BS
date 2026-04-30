@@ -58,6 +58,7 @@ class UnifiedMultiTaskModel(nn.Module):
         num_fog_classes=3,
         num_det_classes=1,
         in_features=None,
+        img_size: int | tuple[int, int] | None = None,
     ):
         """
         初始化统一多任务模型。
@@ -78,6 +79,7 @@ class UnifiedMultiTaskModel(nn.Module):
         super().__init__()
 
         self._num_det_classes = num_det_classes
+        self._img_size = img_size if img_size is not None else Config.IMG_SIZE
 
         # 量化桩用于量化感知训练（QAT）。
         # 输入图像先经过 `QuantStub`，多任务输出再分别经过 `DeQuantStub`，
@@ -177,7 +179,7 @@ class UnifiedMultiTaskModel(nn.Module):
             overrides={
                 "task": "detect",
                 "model": yolo_weights,
-                "imgsz": Config.IMG_SIZE,
+                "imgsz": self._img_size,
                 "single_cls": num_det_classes == 1,
             },
         )
@@ -259,7 +261,12 @@ class UnifiedMultiTaskModel(nn.Module):
           分类头和回归头的输入维度也要随之变化。
         """
         with torch.no_grad():
-            dummy = torch.randn(1, 3, Config.IMG_SIZE, Config.IMG_SIZE)
+            if isinstance(self._img_size, int):
+                img_h = img_w = int(self._img_size)
+            else:
+                img_h = int(self._img_size[0])
+                img_w = int(self._img_size[1])
+            dummy = torch.randn(1, 3, img_h, img_w)
             y = []
             fallback_feature = None
             preferred_feature = None
@@ -380,8 +387,8 @@ class UnifiedMultiTaskModel(nn.Module):
         return (f"UnifiedMultiTaskModel(\n"
                 f"  backbone={self.yolo.yaml.get('scale', 'yolo')},\n"
                 f"  num_det_classes={self._num_det_classes},\n"
+                f"  img_size={self._img_size},\n"
                 f"  in_features={self._in_features},\n"
                 f"  num_fog_classes={self.fog_classifier[-1].out_features},\n"
                 f"  device={next(self.parameters()).device}\n"
                 f")")
-

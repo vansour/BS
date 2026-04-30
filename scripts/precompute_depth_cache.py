@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -69,7 +70,15 @@ def main():
     3. 对缺失样本执行深度预计算；
     4. 输出补算前后的缓存覆盖情况。
     """
-    cfg = Config()
+    parser = argparse.ArgumentParser(description="Precompute missing depth cache files.")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="可选配置文件路径（.json/.yaml/.yml）。",
+    )
+    args = parser.parse_args()
+
+    cfg = Config(config_path=args.config)
 
     train_dataset = MultiTaskDataset(
         cfg.RAW_DATA_DIR,

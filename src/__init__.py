@@ -28,6 +28,7 @@ __all__ = [
     "precompute_depths",
     "DatasetPreparer",
     "HighwayFogSystem",
+    "TemporalVehicleFilter",
     "set_seed",
     "count_parameters",
     "format_time",
@@ -45,6 +46,7 @@ _EXPORTS = {
     "precompute_depths": (".data", "precompute_depths"),
     "DatasetPreparer": (".data", "DatasetPreparer"),
     "HighwayFogSystem": (".inference", "HighwayFogSystem"),
+    "TemporalVehicleFilter": (".temporal_vehicle_filter", "TemporalVehicleFilter"),
     "set_seed": (".utils", "set_seed"),
     "count_parameters": (".utils", "count_parameters"),
     "format_time": (".utils", "format_time"),
@@ -80,6 +82,7 @@ if TYPE_CHECKING:
         precompute_depths,
     )
     from .inference import HighwayFogSystem
+    from .temporal_vehicle_filter import TemporalVehicleFilter
     from .model import FogAugmentation, UnifiedMultiTaskModel
     from .utils import (
         check_cuda_memory,

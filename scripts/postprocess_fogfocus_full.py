@@ -42,6 +42,31 @@ def parse_args() -> argparse.Namespace:
         help="Route evaluation output directory.",
     )
     parser.add_argument(
+        "--candidate-benchmark-config",
+        default=str(ROOT / "configs" / "benchmark_videos.json"),
+        help="Benchmark 视频配置文件，用于候选模型横向对比。",
+    )
+    parser.add_argument(
+        "--baseline-model-config",
+        default=str(ROOT / "configs" / "benchmark_models.json"),
+        help="Baseline 模型配置文件，用于候选模型横向对比。",
+    )
+    parser.add_argument(
+        "--candidate-benchmark-output",
+        default=str(ROOT / "outputs" / "Candidate_Benchmark_fogfocus_full_formal"),
+        help="候选模型 benchmark 输出目录。",
+    )
+    parser.add_argument(
+        "--candidate-benchmark-label",
+        default="fogfocus_full_formal_candidate",
+        help="候选模型在 benchmark 对比中的展示名称。",
+    )
+    parser.add_argument(
+        "--skip-candidate-benchmark",
+        action="store_true",
+        help="跳过候选模型与 baseline 集合的横向对比。",
+    )
+    parser.add_argument(
         "--sample-stride",
         type=int,
         default=5,
@@ -97,6 +122,39 @@ def run_route_eval(
     subprocess.run(cmd, cwd=str(ROOT), check=True)
 
 
+def run_candidate_benchmark(
+    fog_weights: Path,
+    candidate_label: str,
+    benchmark_config: Path,
+    baseline_model_config: Path,
+    output_dir: Path,
+    sample_stride: int,
+    max_frames: int,
+):
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "benchmark_candidate_model.py"),
+        "--candidate-weights",
+        str(fog_weights),
+        "--candidate-label",
+        str(candidate_label),
+        "--benchmark-config",
+        str(benchmark_config),
+        "--base-model-config",
+        str(baseline_model_config),
+        "--output-dir",
+        str(output_dir),
+        "--sample-stride",
+        str(sample_stride),
+        "--max-frames",
+        str(max_frames),
+        "--reuse-existing",
+    ]
+    print("Running candidate benchmark:")
+    print(" ".join(cmd))
+    subprocess.run(cmd, cwd=str(ROOT), check=True)
+
+
 def maybe_load_previous_baseline() -> dict | None:
     baseline = ROOT / "outputs" / "Route_Eval_fogfocus_final" / "route_eval_summary.json"
     if not baseline.exists():
@@ -110,6 +168,8 @@ def build_summary(
     route_eval_output: Path,
     training_summary: dict,
     route_eval_summary: dict,
+    candidate_benchmark_summary: dict | None,
+    candidate_benchmark_output: Path | None,
     baseline_summary: dict | None,
 ) -> dict:
     latest_video = route_eval_summary["videos"][0]
@@ -143,6 +203,15 @@ def build_summary(
             "recommendation": latest_video["heuristic_recommendation"],
         },
     }
+
+    if candidate_benchmark_summary and candidate_benchmark_output is not None:
+        summary["artifacts"]["candidate_benchmark_summary_json"] = str(
+            candidate_benchmark_output / "candidate_benchmark_summary.json"
+        )
+        summary["artifacts"]["candidate_benchmark_summary_md"] = str(
+            candidate_benchmark_output / "candidate_benchmark_summary.md"
+        )
+        summary["candidate_benchmark"] = candidate_benchmark_summary
 
     if baseline_summary:
         baseline_video = baseline_summary["videos"][0]
@@ -216,6 +285,23 @@ def write_markdown(path: Path, summary: dict):
             "",
         ]
     )
+
+    candidate = summary.get("candidate_benchmark")
+    if candidate:
+        lines.extend(
+            [
+                "## Candidate Benchmark",
+                "",
+                f"- Candidate label: `{candidate['candidate']['label']}`",
+                f"- Unified mean detections/frame rank: `{candidate['candidate']['rankings']['weighted_unified_mean_count_per_frame']}`",
+                f"- Unified nonzero-detection ratio rank: `{candidate['candidate']['rankings']['weighted_unified_frames_with_detections_ratio']}`",
+                f"- Fog switch rate rank: `{candidate['candidate']['rankings']['weighted_dominant_switch_rate']}`",
+                f"- Beta abs delta mean rank: `{candidate['candidate']['rankings']['weighted_beta_abs_delta_mean']}`",
+                f"- Candidate benchmark JSON: `{summary['artifacts']['candidate_benchmark_summary_json']}`",
+                f"- Candidate benchmark Markdown: `{summary['artifacts']['candidate_benchmark_summary_md']}`",
+                "",
+            ]
+        )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -225,6 +311,9 @@ def main() -> int:
     video = Path(args.video).resolve()
     route_eval_output = Path(args.route_eval_output).resolve()
     route_eval_output.mkdir(parents=True, exist_ok=True)
+    candidate_benchmark_output = Path(args.candidate_benchmark_output).resolve()
+    benchmark_config = Path(args.candidate_benchmark_config).resolve()
+    baseline_model_config = Path(args.baseline_model_config).resolve()
 
     run_dir = latest_completed_run(train_output_dir)
     training_summary = load_json(run_dir / "summary.json")
@@ -241,6 +330,21 @@ def main() -> int:
     )
 
     route_eval_summary = load_json(route_eval_output / "route_eval_summary.json")
+    candidate_benchmark_summary = None
+    if not args.skip_candidate_benchmark:
+        candidate_benchmark_output.mkdir(parents=True, exist_ok=True)
+        run_candidate_benchmark(
+            best_model,
+            args.candidate_benchmark_label,
+            benchmark_config,
+            baseline_model_config,
+            candidate_benchmark_output,
+            args.sample_stride,
+            args.max_frames,
+        )
+        candidate_benchmark_summary = load_json(
+            candidate_benchmark_output / "candidate_benchmark_summary.json"
+        )
     baseline_summary = maybe_load_previous_baseline()
 
     summary = build_summary(
@@ -249,6 +353,8 @@ def main() -> int:
         route_eval_output,
         training_summary,
         route_eval_summary,
+        candidate_benchmark_summary,
+        candidate_benchmark_output if candidate_benchmark_summary else None,
         baseline_summary,
     )
 

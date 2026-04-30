@@ -14,6 +14,7 @@ Model Export Script
 
 import os
 import sys
+import argparse
 
 import torch
 
@@ -36,7 +37,28 @@ from src.model import UnifiedMultiTaskModel
 from src.utils import load_model_weights, resolve_model_weights
 
 
-def export_qat_onnx(weights_path, onnx_path, device="cpu"):
+def parse_args() -> argparse.Namespace:
+    """解析导出脚本命令行参数。"""
+    parser = argparse.ArgumentParser(description="Export the unified model to ONNX.")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="可选配置文件路径（.json/.yaml/.yml）。",
+    )
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="可选模型权重路径；未提供时按默认优先级自动解析。",
+    )
+    parser.add_argument(
+        "--onnx-path",
+        default=None,
+        help="可选 ONNX 输出路径；未提供时默认写入 outputs/unified_multitask.onnx。",
+    )
+    return parser.parse_args()
+
+
+def export_qat_onnx(weights_path, onnx_path, device="cpu", cfg: Config | None = None):
     """
     将当前统一模型导出为 ONNX 文件。
 
@@ -57,11 +79,12 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
             "ONNX export requires the 'onnx' package. Install it with `pip install onnx`."
         )
 
-    cfg = Config()
+    cfg = cfg or Config()
     model = UnifiedMultiTaskModel(
         cfg.YOLO_BASE_MODEL,
         cfg.NUM_FOG_CLASSES,
         num_det_classes=cfg.NUM_DET_CLASSES,
+        img_size=cfg.IMG_SIZE,
     )
 
     # 如有可用权重，则优先加载训练好的模型参数；否则允许导出随机初始化版本。
@@ -119,7 +142,7 @@ def export_qat_onnx(weights_path, onnx_path, device="cpu"):
     print(f"ONNX export succeeded: {onnx_path}")
 
 
-def get_trt_int8_config_example():
+def get_trt_int8_config_example(cfg: Config | None = None):
     """
     返回一个 TensorRT INT8 引擎构建示例代码片段。
 
@@ -129,7 +152,7 @@ def get_trt_int8_config_example():
     这里返回字符串而不是直接执行，是因为 TensorRT 环境通常与当前开发机环境不同，
     更适合把示例打印出来，交给目标部署环境参考执行。
     """
-    cfg = Config()
+    cfg = cfg or Config()
     code_snippet = f"""
 import tensorrt as trt
 
@@ -192,23 +215,28 @@ def print_jetson_deployment_tips(onnx_path):
 
 def main():
     """执行 ONNX 导出与部署提示输出流程。"""
+    args = parse_args()
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    cfg = Config()
+    cfg = Config(config_path=args.config)
 
     # 自动解析最合适的权重文件，优先使用验证表现最好的模型文件，
     # 避免默认导出训练结束时的最后状态而回退部署效果。
-    weights_path = resolve_model_weights(
+    weights_path = args.weights or resolve_model_weights(
         cfg.OUTPUT_DIR,
         cfg.CHECKPOINT_DIR,
         preferred_files=["unified_model_best.pt", "unified_model.pt"],
     )
-    output_onnx = os.path.join(base_dir, "..", "outputs", "unified_multitask.onnx")
+    output_onnx = (
+        args.onnx_path
+        if args.onnx_path
+        else os.path.join(base_dir, "..", "outputs", "unified_multitask.onnx")
+    )
     os.makedirs(os.path.dirname(output_onnx), exist_ok=True)
 
-    export_qat_onnx(weights_path, output_onnx, device="cpu")
+    export_qat_onnx(weights_path, output_onnx, device="cpu", cfg=cfg)
 
     print("\nTensorRT INT8 build example (Python API):")
-    print(get_trt_int8_config_example())
+    print(get_trt_int8_config_example(cfg))
     print_jetson_deployment_tips(output_onnx)
 
 

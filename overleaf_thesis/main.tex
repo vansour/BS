@@ -1,124 +1,79 @@
-\documentclass[UTF8,openany,oneside]{ctexbook}
-\usepackage[a4paper,left=3.0cm,right=2.5cm,top=2.8cm,bottom=2.6cm,headheight=15pt,headsep=0.8cm]{geometry}
-\usepackage{graphicx}
+\documentclass{xduugthesis}
+
 \usepackage{amsmath,amssymb}
-\usepackage{booktabs}
 \usepackage{array}
-\usepackage{tabularx}
-\usepackage{longtable}
+\usepackage{booktabs}
 \usepackage{enumitem}
-\usepackage{caption}
-\usepackage{tocloft}
 \usepackage{float}
-\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{tabularx}
 \usepackage{xurl}
-\usepackage{setspace}
-\usepackage{fancyhdr}
-\usepackage{titlesec}
-\usepackage{indentfirst}
+
+\setlist[enumerate]{itemsep=0pt,parsep=0pt,topsep=0pt,partopsep=0pt}
+\setlist[itemize]{itemsep=0pt,parsep=0pt,topsep=0pt,partopsep=0pt}
 
 \input{metadata.tex}
 
-\hypersetup{
-  colorlinks=true,
-  linkcolor=blue,
-  urlcolor=blue,
-  citecolor=blue,
-  pdftitle={基于深度估计与多任务学习的高速公路团雾监测方法研究},
-  pdfauthor={\thesisauthor}
+\pdfstringdefDisableCommands{
+  \def\\{ }
+  \def\code#1{#1}
+  \def\codeword#1{#1}
 }
 
-\newcommand{\code}[1]{\path{#1}}
-\newcommand{\codeword}[1]{\texttt{#1}}
+\xdusetup{
+  info / title = { 基于深度估计与多任务学习的\\高速公路团雾监测方法研究 },
+  info / department = { \thesiscollege },
+  info / major = { \thesismajor },
+  info / author = { \thesisauthor },
+  info / supervisor = { \thesisadvisor },
+  info / class-id = { \thesisclassid },
+  info / student-id = { \thesisstudentid },
+  info / abstract = { sections/00_abstract_cn.tex },
+  info / abstract* = { sections/01_abstract_en.tex },
+  info / keywords = {
+    高速公路团雾,
+    低能见度监测,
+    深度估计,
+    在线造雾,
+    多任务学习,
+    智能交通
+  },
+  info / keywords* = {
+    highway fog monitoring,
+    low-visibility perception,
+    depth estimation,
+    online fog synthesis,
+    multi-task learning,
+    intelligent transportation
+  },
+  info / bib-resource = { references.bib },
+  info / acknowledgements = { sections/11_acknowledgements.tex },
+  info / appendix = { sections/12_appendix.tex }
+}
 
-\setlength{\parindent}{2em}
-\setlength{\parskip}{0.15em}
-\setlength{\emergencystretch}{2em}
-\linespread{1.35}
-\setcounter{tocdepth}{2}
-\pagestyle{fancy}
-\fancyhf{}
-\fancyhead[C]{\small\thesisschool\ \thesistype}
-\fancyfoot[C]{\thepage}
-\renewcommand{\headrulewidth}{0.4pt}
-\titleformat{\chapter}[display]{\centering\bfseries\zihao{3}}{第\thechapter 章}{1em}{}
-\titleformat{\section}{\bfseries\zihao{4}}{\thesection}{1em}{}
-\titleformat{\subsection}{\bfseries\zihao{-4}}{\thesubsection}{1em}{}
-\titleformat{\subsubsection}{\bfseries\zihao{5}}{\thesubsubsection}{1em}{}
-\titlespacing*{\chapter}{0pt}{0pt}{18pt}
-\captionsetup[figure]{font=small,labelfont=bf,labelsep=quad}
-\captionsetup[table]{font=small,labelfont=bf,labelsep=quad}
-\renewcommand{\contentsname}{目\quad 录}
-\setlength{\cftbeforechapskip}{6pt}
-\setlength{\cftbeforesecskip}{2pt}
-\renewcommand{\cftchapfont}{\bfseries}
-\renewcommand{\cftchappagefont}{\bfseries}
+\DeclareRobustCommand{\code}[1]{\begingroup\urlstyle{same}\nolinkurl{#1}\endgroup}
+\DeclareRobustCommand{\codeword}[1]{\begingroup\urlstyle{same}\nolinkurl{#1}\endgroup}
 \graphicspath{{assets/figures/}}
+
+\AtBeginDocument{
+  \ctexset{
+    section / format = {
+      \rmfamily\zihao{4}\linespread{1.5}\selectfont\centering
+    },
+    subsection / format = {
+      \rmfamily\zihao{-4}\linespread{1.5}\selectfont\raggedright
+    },
+    subsection / afterskip = { 10.5pt },
+    subsubsection / format = {
+      \rmfamily\zihao{-4}\linespread{1.5}\selectfont\raggedright
+    },
+    subsubsection / afterskip = { 10.5pt }
+  }
+}
 
 \begin{document}
 
-\begin{titlepage}
-  \centering
-  \vspace*{1.8cm}
-  {\zihao{-0}\bfseries \thesisschool\par}
-  \vspace{1.0cm}
-  {\zihao{-1}\bfseries \thesistype\par}
-  \vspace{2.8cm}
-  {\zihao{2}\bfseries \thesistitle\par}
-  \vspace{0.8cm}
-  {\large\itshape \thesistitleen\par}
-  \vspace{2.8cm}
-  \renewcommand{\arraystretch}{1.8}
-  \begin{tabular}{p{4cm}p{8.2cm}}
-    学\hfill 院： & \thesiscollege \\
-    专\hfill 业： & \thesismajor \\
-    学生姓名： & \thesisauthor \\
-    学\hfill 号： & \thesisstudentid \\
-    指导教师： & \thesisadvisor \\
-    完成日期： & \thesisdate \\
-  \end{tabular}
-  \vfill
-  {\small 本模板已根据当前项目内容自动整理，可直接导入 Overleaf 继续排版。\par}
-\end{titlepage}
-
-\clearpage
-\thispagestyle{empty}
-\begin{center}
-  {\zihao{3}\bfseries 原创性声明}
-\end{center}
-\vspace{1.2cm}
-本人郑重声明：所提交的毕业设计（论文）是在指导教师指导下独立完成的研究成果。除文中已经注明引用的内容外，本论文不包含任何他人已经发表或撰写过的研究成果。对本文研究做出重要贡献的个人和集体，均已在文中以明确方式标明。
-
-\vspace{2.2cm}
-\begin{flushright}
-  学生签名：\rule{4cm}{0.4pt}\\[1.2cm]
-  日期：\rule{4cm}{0.4pt}
-\end{flushright}
-
-\vspace{2.0cm}
-\begin{center}
-  {\zihao{3}\bfseries 使用授权声明}
-\end{center}
-\vspace{1.2cm}
-本人完全了解学校关于毕业设计（论文）保存、使用和归档的有关规定，同意学校保留并向有关部门送交毕业设计（论文）的复印件和电子版，允许毕业设计（论文）被查阅和借阅。
-
-\vspace{2.2cm}
-\begin{flushright}
-  学生签名：\rule{4cm}{0.4pt}\\[1.2cm]
-  指导教师签名：\rule{4cm}{0.4pt}\\[1.2cm]
-  日期：\rule{4cm}{0.4pt}
-\end{flushright}
-
-\clearpage
-\frontmatter
-\input{sections/00_abstract_cn.tex}
-\input{sections/01_abstract_en.tex}
-\tableofcontents
-\clearpage
-
-\mainmatter
 \input{sections/02_chapter_01.tex}
-\input{sections/03_chapter_02.tex}
 \input{sections/04_chapter_03.tex}
 \input{sections/05_chapter_04.tex}
 \input{sections/06_chapter_05.tex}
@@ -126,9 +81,5 @@
 \input{sections/08_chapter_07.tex}
 \input{sections/09_chapter_08.tex}
 \input{sections/10_chapter_09.tex}
-
-\input{sections/11_references.tex}
-\appendix
-\input{sections/12_appendix.tex}
 
 \end{document}

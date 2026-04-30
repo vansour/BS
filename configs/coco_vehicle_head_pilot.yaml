@@ -1,0 +1,7 @@
+model:
+  det_head_mode: "coco_vehicle"
+
+resume:
+  model_only: true
+  nonstrict_model_only: true
+  reset_epoch: true

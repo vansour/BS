@@ -135,6 +135,7 @@ def run_forward_check(cfg, device: str) -> None:
         cfg.YOLO_BASE_MODEL,
         cfg.NUM_FOG_CLASSES,
         num_det_classes=cfg.NUM_DET_CLASSES,
+        img_size=cfg.IMG_SIZE,
     ).to(device)
     model.eval()
 
@@ -190,6 +191,11 @@ def main() -> int:
         help="覆盖 smoke test 使用的设备；默认沿用 src.config.Config.DEVICE。",
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="可选配置文件路径（.json/.yaml/.yml）。",
+    )
+    parser.add_argument(
         "--full-depth-scan",
         action="store_true",
         help="扫描全部 train/val 样本的深度缓存覆盖情况；默认只抽样前 256 个样本。",
@@ -231,7 +237,7 @@ def main() -> int:
     from src.config import Config
     from src.data import MultiTaskDataset
 
-    cfg = Config()
+    cfg = Config(config_path=args.config)
     device = args.device or cfg.DEVICE
     print(f"  - device: {device}")
     print(f"  - yolo_base_model: {cfg.YOLO_BASE_MODEL}")

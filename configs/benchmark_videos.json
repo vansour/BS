@@ -1,0 +1,114 @@
+{
+  "benchmark_id": "benchmark_v1",
+  "description": "Formal benchmark_v1 video set for route evaluation. Relative paths are resolved from the repository root.",
+  "scope": {
+    "purpose": "Use one fixed video list and one fixed sampling policy to compare unified fog-model checkpoints across iterations.",
+    "selection_rules": [
+      "Prefer real highway or roadside deployment videos over synthetic examples.",
+      "Cover at least light fog, medium fog, patchy/local fog, sparse traffic, and dense traffic.",
+      "Once benchmark_v1 is frozen, do not silently replace existing entries; only append new versions under a new benchmark_id."
+    ],
+    "current_limitations": [
+      "The current workspace only ships one real fog video, so benchmark_v1 is structurally valid but still under-covered.",
+      "Before using the benchmark for thesis-level claims, expand this list to at least 4 to 6 videos."
+    ]
+  },
+  "default_runtime": {
+    "sample_stride": 5,
+    "max_frames": 300
+  },
+  "videos": [
+    {
+      "label": "getty_demo_real_fog",
+      "path": "gettyimages-1353950094-640_adpp.mp4",
+      "tags": [
+        "real-video",
+        "benchmark_v1",
+        "fog",
+        "demo"
+      ],
+      "notes": "Current workspace baseline video. Keep this entry fixed; expand benchmark_v1 by appending more videos instead of replacing it.",
+      "fog_density": "unknown",
+      "traffic_density": "medium",
+      "status": "active",
+      "sample_stride": 5,
+      "max_frames": 300
+    },
+    {
+      "label": "control_clear_sparse_traffic_day",
+      "path": "benchmarks/videos/ua_detrac_mvi40152_clear_sparse_day.mp4",
+      "tags": [
+        "real-video",
+        "benchmark_v1",
+        "clear-control",
+        "uadetrac",
+        "sparse-traffic"
+      ],
+      "notes": "Real clear-weather control clip built from UA-DETRAC sequence MVI_40152.",
+      "fog_density": "clear",
+      "traffic_density": "sparse",
+      "status": "active",
+      "source_sequence": "MVI_40152",
+      "clip_start_frame": 200,
+      "clip_num_frames": 300,
+      "fps": 25
+    },
+    {
+      "label": "control_clear_medium_traffic_day",
+      "path": "benchmarks/videos/ua_detrac_mvi20033_clear_medium_day.mp4",
+      "tags": [
+        "real-video",
+        "benchmark_v1",
+        "clear-control",
+        "uadetrac",
+        "medium-traffic"
+      ],
+      "notes": "Real clear-weather control clip built from UA-DETRAC sequence MVI_20033.",
+      "fog_density": "clear",
+      "traffic_density": "medium",
+      "status": "active",
+      "source_sequence": "MVI_20033",
+      "clip_start_frame": 180,
+      "clip_num_frames": 300,
+      "fps": 25
+    },
+    {
+      "label": "control_clear_heavy_traffic_day",
+      "path": "benchmarks/videos/ua_detrac_mvi20011_clear_heavy_day.mp4",
+      "tags": [
+        "real-video",
+        "benchmark_v1",
+        "clear-control",
+        "uadetrac",
+        "heavy-traffic"
+      ],
+      "notes": "Real clear-weather control clip built from UA-DETRAC sequence MVI_20011.",
+      "fog_density": "clear",
+      "traffic_density": "heavy",
+      "status": "active",
+      "source_sequence": "MVI_20011",
+      "clip_start_frame": 120,
+      "clip_num_frames": 300,
+      "fps": 25
+    },
+    {
+      "label": "control_clear_dense_traffic_day",
+      "path": "benchmarks/videos/ua_detrac_mvi20035_clear_dense_day.mp4",
+      "tags": [
+        "real-video",
+        "benchmark_v1",
+        "clear-control",
+        "uadetrac",
+        "dense-traffic"
+      ],
+      "notes": "Real clear-weather control clip built from UA-DETRAC sequence MVI_20035.",
+      "fog_density": "clear",
+      "traffic_density": "dense",
+      "status": "active",
+      "source_sequence": "MVI_20035",
+      "clip_start_frame": 220,
+      "clip_num_frames": 300,
+      "fps": 25
+    }
+  ]
+}

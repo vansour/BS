@@ -250,6 +250,7 @@ def main() -> int:
         cfg.YOLO_BASE_MODEL,
         cfg.NUM_FOG_CLASSES,
         num_det_classes=cfg.NUM_DET_CLASSES,
+        img_size=cfg.IMG_SIZE,
     )
     load_model_weights(teacher, str(source_weights), map_location=cfg.DEVICE)
     teacher.to(cfg.DEVICE).eval()
@@ -258,6 +259,7 @@ def main() -> int:
         cfg.YOLO_BASE_MODEL,
         cfg.NUM_FOG_CLASSES,
         num_det_classes=cfg.NUM_DET_CLASSES,
+        img_size=cfg.IMG_SIZE,
     )
     load_model_weights(student, str(source_weights), map_location=cfg.DEVICE)
     student.to(cfg.DEVICE)
